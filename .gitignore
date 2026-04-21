@@ -1,0 +1,16 @@
+# PlatformIO build/cache
+.pio/
+.piolibdeps/
+
+# IDE/editor local files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Temporary research/cloned refs
+_tmp_*/
+
+# OS / misc noise
+*.log
+Thumbs.db
+.DS_Store
