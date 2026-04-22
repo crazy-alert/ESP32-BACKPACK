@@ -1200,7 +1200,10 @@ String telemetry_json() {
   out += "\"flight_mode\":\"" + json_escape(telemetry.flight_mode) + "\",";
   out += "\"is_armed\":" + String(telemetry.is_armed ? "true" : "false") + ",";
 
+  const bool alarm_active = last_alarm_uplink || last_alarm_downlink || last_alarm_lq || last_alarm_telem ||
+                            last_alarm_board_batt || last_alarm_drone_batt;
   out += "\"alarm\":{";
+  out += "\"active\":" + String(alarm_active ? "true" : "false") + ",";
   out += "\"event_id\":" + String(alarm_event_id) + ",";
   out += "\"name\":\"" + json_escape(last_alarm_name) + "\",";
   out += "\"sound\":\"" + json_escape(last_alarm_sound) + "\",";
@@ -1473,6 +1476,7 @@ void handle_root() {
     input,select{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);background:#0f172a;color:var(--txt)}
     button{padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#1f2937;color:var(--txt);cursor:pointer}
     .ok{color:var(--ok)} .muted{color:var(--muted);font-size:12px}
+    .warn{color:#f59e0b}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
     code{white-space:pre-wrap}
     .bar-wrap{margin:6px 0 10px}
@@ -1482,6 +1486,11 @@ void handle_root() {
     .fill{height:100%;width:0%;transition:width .2s;background:#22c55e}
     .fill.yellow{background:#facc15}
     .fill.red{background:#ef4444}
+    .telemetry-stale{opacity:.65}
+    .telemetry-stale h3,.telemetry-stale .k,.telemetry-stale .v{text-decoration:line-through}
+    .telemetry-stale .v{font-weight:600}
+    #drone_bar_row.telemetry-stale .bar{opacity:.45}
+    #drone_bar_row.telemetry-stale #txt_drone{text-decoration:line-through}
     body.alarm-flash{background:#7f1d1d !important;transition:background .15s}
     #alarm_overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none}
     #alarm_box{background:#111827;border:1px solid #ef4444;color:#fecaca;padding:16px 22px;border-radius:12px;font-weight:700;font-size:20px}
@@ -1493,12 +1502,12 @@ void handle_root() {
   <div id="alarm_overlay"><div id="alarm_box">ALARM</div></div>
 
   <div class="bar-wrap">
-    <div class="bar-row">
+    <div class="bar-row" id="board_bar_row">
       <div class="emoji">⚙️</div>
       <div class="bar"><div id="bar_board" class="fill"></div></div>
       <div id="txt_board" class="muted">0%</div>
     </div>
-    <div class="bar-row">
+    <div class="bar-row" id="drone_bar_row">
       <div class="emoji">✈️</div>
       <div class="bar"><div id="bar_drone" class="fill"></div></div>
       <div id="txt_drone" class="muted">0%</div>
@@ -1628,9 +1637,11 @@ void handle_root() {
 <script>
 const by = id => document.getElementById(id);
 const f = (n, d = 1) => Number.isFinite(n) ? Number(n).toFixed(d) : "-";
+const TELEMETRY_STALE_MS = 3000;
 let cfg = null;
 let sounds = [];
 let lastAlarmId = 0;
+let alarmPopupUntilMs = 0;
 let gpsPoints = [];
 let gpsIdx = -1;
 
@@ -1693,23 +1704,45 @@ function setBar(id, txtId, pct){
 }
 
 function maybePlayAlarm(t){
-  if (!t.alarm) return;
-  if (t.alarm.event_id <= lastAlarmId) return;
-  lastAlarmId = t.alarm.event_id;
-  document.body.classList.add('alarm-flash');
-  by('alarm_box').textContent = t.alarm.name || 'ALARM';
-  by('alarm_overlay').style.display = 'flex';
-  setTimeout(()=>{
-    document.body.classList.remove('alarm-flash');
-    by('alarm_overlay').style.display = 'none';
-  }, 1000);
-  if (!t.alarm.sound) return;
-  const a = new Audio(`/sound?file=${encodeURIComponent(t.alarm.sound)}`);
-  a.play().catch(()=>{});
+  const now = Date.now();
+  const alarm = t.alarm || {};
+  const active = !!alarm.active;
+  document.body.classList.toggle('alarm-flash', active);
+
+  if (alarm.event_id > lastAlarmId) {
+    lastAlarmId = alarm.event_id;
+    by('alarm_box').textContent = alarm.name || 'ALARM';
+    alarmPopupUntilMs = now + 2500;
+    if (alarm.sound) {
+      const a = new Audio(`/sound?file=${encodeURIComponent(alarm.sound)}`);
+      a.play().catch(()=>{});
+    }
+  }
+
+  by('alarm_overlay').style.display = now < alarmPopupUntilMs ? 'flex' : 'none';
+}
+
+function setStaleView(isStale){
+  ['gps','bat','link','att','unknown'].forEach(id => {
+    by(id).classList.toggle('telemetry-stale', isStale);
+  });
+  by('drone_bar_row').classList.toggle('telemetry-stale', isStale);
 }
 
 function drawTelemetry(t){
-  by('state').textContent = t.frames_total > 0 ? 'Telemetry active' : 'No telemetry yet';
+  const ageMs = Math.max(0, Number(t.uptime_ms || 0) - Number(t.last_frame_ms || 0));
+  const hasFrames = Number(t.frames_total || 0) > 0;
+  const isStale = hasFrames && ageMs > TELEMETRY_STALE_MS;
+  if (!hasFrames) {
+    by('state').textContent = 'No telemetry yet';
+    by('state').className = 'warn';
+  } else if (isStale) {
+    by('state').textContent = `Telemetry stale (${(ageMs / 1000).toFixed(1)} s since last frame)`;
+    by('state').className = 'warn';
+  } else {
+    by('state').textContent = 'Telemetry active';
+    by('state').className = 'ok';
+  }
   by('gps').innerHTML = `<h3>GPS</h3><div class="row"><span class="k">Fix</span><span class="v">${t.gps.fix}</span></div><div class="row"><span class="k">Sats</span><span class="v">${t.gps.sats}</span></div><div class="row"><span class="k">Lat</span><span class="v">${f(t.gps.lat,7)}</span></div><div class="row"><span class="k">Lon</span><span class="v">${f(t.gps.lon,7)}</span></div><div class="row"><span class="k">Speed</span><span class="v">${f(t.gps.speed_kmh)} km/h</span></div>`;
   by('bat').innerHTML = `<h3>Battery</h3><div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${f(t.board_battery.voltage,2)} V</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.percent} %</span></div>`;
   by('link').innerHTML = `<h3>Link</h3><div class="row"><span class="k">RSSI1</span><span class="v">${t.link.rssi1_dbm} dBm</span></div><div class="row"><span class="k">RSSI2</span><span class="v">${t.link.rssi2_dbm} dBm</span></div><div class="row"><span class="k">LQ</span><span class="v">${t.link.lq}</span></div><div class="row"><span class="k">SNR</span><span class="v">${t.link.snr_db} dB</span></div><div class="row"><span class="k">Active Ant</span><span class="v">${t.link.active_antenna}</span></div><div class="row"><span class="k">Down RSSI</span><span class="v">${t.link.down_rssi_dbm} dBm</span></div><div class="row"><span class="k">Down LQ</span><span class="v">${t.link.down_lq}</span></div><div class="row"><span class="k">Down SNR</span><span class="v">${t.link.down_snr_db} dB</span></div>`;
@@ -1718,6 +1751,7 @@ function drawTelemetry(t){
   by('sd_status').textContent = `SD: ${t.sd.status}`;
   setBar('bar_board','txt_board', t.board_battery.percent);
   setBar('bar_drone','txt_drone', t.battery.remaining_pct);
+  setStaleView(isStale);
   drawUnknown(t.unknown_types);
   maybePlayAlarm(t);
 }
