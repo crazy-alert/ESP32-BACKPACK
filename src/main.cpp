@@ -5,6 +5,8 @@
 #include <SD.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <time.h>
+#include <driver/i2s.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <mbedtls/md5.h>
@@ -31,6 +33,18 @@ constexpr int SD_MOSI_PIN = 23;
 
 // Active buzzer pin (for tone alarms)
 constexpr int BUZZER_PIN = 25;
+
+// MAX98357A over I2S
+constexpr int I2S_BCLK_PIN = 26;
+constexpr int I2S_LRCLK_PIN = 27;
+constexpr int I2S_DOUT_PIN = 22;
+
+// Status LED (fallback to GPIO2 when board variant does not define LED_BUILTIN)
+#ifdef LED_BUILTIN
+constexpr int STATUS_LED_PIN = LED_BUILTIN;
+#else
+constexpr int STATUS_LED_PIN = 2;
+#endif
 
 struct TelemetryData {
   bool gps_fix = false;
@@ -118,6 +132,14 @@ struct BuzzerConfig {
   bool alarm_telem_loss_enabled = true;
   int alarm_telem_loss_sec = 3;
   String alarm_telem_loss_sound = "telem_lost.wav";
+
+  bool alarm_board_batt_enabled = false;
+  int alarm_board_batt_min_pct = 30;
+  String alarm_board_batt_sound = "board_batt_low.wav";
+
+  bool alarm_drone_batt_enabled = false;
+  int alarm_drone_batt_min_pct = 30;
+  String alarm_drone_batt_sound = "drone_batt_low.wav";
 };
 
 struct AppConfig {
@@ -152,10 +174,30 @@ bool last_alarm_uplink = false;
 bool last_alarm_downlink = false;
 bool last_alarm_lq = false;
 bool last_alarm_telem = false;
+bool last_alarm_board_batt = false;
+bool last_alarm_drone_batt = false;
 uint32_t alarm_event_id = 0;
 String last_alarm_name;
 String last_alarm_sound;
 unsigned long last_alarm_ms = 0;
+unsigned long last_led_blink_ms = 0;
+bool led_blink_state = false;
+
+struct AudioPlayer {
+  bool i2s_ready = false;
+  bool playing = false;
+  File file;
+  uint32_t data_remaining = 0;
+  uint32_t sample_rate = 16000;
+  String current_file;
+} audio_player;
+
+bool clock_synced = false;
+time_t clock_epoch_base = 0;
+unsigned long clock_millis_base = 0;
+enum TimeSourcePriority { TS_NONE = 0, TS_WEB = 1, TS_REAL = 2 };
+TimeSourcePriority clock_source_priority = TS_NONE;
+String clock_source_name = "none";
 
 String wifi_note = "home wifi disabled";
 
@@ -181,6 +223,11 @@ uint16_t read_be16(const uint8_t *p) {
 uint32_t read_be24(const uint8_t *p) {
   return (static_cast<uint32_t>(p[0]) << 16) |
          (static_cast<uint32_t>(p[1]) << 8) | p[2];
+}
+
+uint32_t read_be32u(const uint8_t *p) {
+  return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | p[3];
 }
 
 int32_t read_be32s(const uint8_t *p) {
@@ -216,6 +263,213 @@ String bytes_to_hex(const uint8_t *data, uint8_t len) {
   }
   out.toUpperCase();
   return out;
+}
+
+String format_uptime(unsigned long ms) {
+  const unsigned long total_s = ms / 1000UL;
+  const unsigned long day = total_s / 86400UL;
+  const unsigned long hh = (total_s % 86400UL) / 3600UL;
+  const unsigned long mm = (total_s % 3600UL) / 60UL;
+  const unsigned long ss = total_s % 60UL;
+  char buf[40] = {0};
+  snprintf(buf, sizeof(buf), "D+%lu %02lu:%02lu:%02lu.%03lu", day, hh, mm, ss, ms % 1000UL);
+  return String(buf);
+}
+
+String current_timestamp_string() {
+  if (!clock_synced) return "";
+
+  const unsigned long now_ms = millis();
+  const time_t now = clock_epoch_base + static_cast<time_t>((now_ms - clock_millis_base) / 1000UL);
+  struct tm tmv = {};
+#if defined(_MSC_VER)
+  gmtime_s(&tmv, &now);
+#else
+  gmtime_r(&now, &tmv);
+#endif
+  char buf[32] = {0};
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+  return String(buf);
+}
+
+void set_clock_base(time_t epoch, TimeSourcePriority src, const char *name) {
+  if (epoch < 946684800) return;  // 2000-01-01
+  if (src < clock_source_priority) return;
+  clock_epoch_base = epoch;
+  clock_millis_base = millis();
+  clock_synced = true;
+  clock_source_priority = src;
+  clock_source_name = String(name);
+}
+
+bool profile_is_empty(const BindProfile &p) {
+  return p.note.isEmpty() && p.bind_phrase.isEmpty() && p.uid_text.isEmpty();
+}
+
+int find_profile_by_bind(const String &bind_phrase, const String &uid_text) {
+  for (int i = 0; i < MAX_BIND_PROFILES; i++) {
+    if (config.profiles[i].bind_phrase == bind_phrase && config.profiles[i].uid_text == uid_text &&
+        !profile_is_empty(config.profiles[i])) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+int first_empty_profile_slot() {
+  for (int i = 0; i < MAX_BIND_PROFILES; i++) {
+    if (profile_is_empty(config.profiles[i])) return i;
+  }
+  return -1;
+}
+
+void upsert_current_profile(const String &note) {
+  int idx = find_profile_by_bind(config.bind_phrase, config.uid_text);
+  if (idx < 0) idx = first_empty_profile_slot();
+  if (idx < 0) idx = 0;
+
+  if (!note.isEmpty()) {
+    config.profiles[idx].note = note;
+  } else if (config.profiles[idx].note.isEmpty()) {
+    config.profiles[idx].note = "Profile " + String(idx);
+  }
+  config.profiles[idx].bind_phrase = config.bind_phrase;
+  config.profiles[idx].uid_text = config.uid_text;
+}
+
+void i2s_init_once() {
+  if (audio_player.i2s_ready) return;
+
+  const i2s_config_t cfg = {
+      .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = 16000,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = 0,
+      .dma_buf_count = 6,
+      .dma_buf_len = 256,
+      .use_apll = false,
+      .tx_desc_auto_clear = true,
+      .fixed_mclk = 0,
+  };
+  const i2s_pin_config_t pins = {
+      .bck_io_num = I2S_BCLK_PIN,
+      .ws_io_num = I2S_LRCLK_PIN,
+      .data_out_num = I2S_DOUT_PIN,
+      .data_in_num = I2S_PIN_NO_CHANGE,
+  };
+
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
+  i2s_set_pin(I2S_NUM_0, &pins);
+  i2s_set_clk(I2S_NUM_0, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  audio_player.i2s_ready = true;
+}
+
+uint32_t le_u32(const uint8_t *p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint16_t le_u16(const uint8_t *p) {
+  return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
+bool start_wav_playback(const String &file_name) {
+  if (!sd_available || file_name.isEmpty()) return false;
+  i2s_init_once();
+
+  String path = "/sound/" + file_name;
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f) return false;
+
+  uint8_t hdr[12];
+  if (f.read(hdr, sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
+    f.close();
+    return false;
+  }
+  if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(&hdr[8], "WAVE", 4) != 0) {
+    f.close();
+    return false;
+  }
+
+  uint16_t audio_fmt = 0;
+  uint16_t channels = 0;
+  uint32_t sample_rate = 0;
+  uint16_t bits = 0;
+  uint32_t data_size = 0;
+  size_t data_pos = 0;
+
+  while (f.available() >= 8) {
+    uint8_t ch[8];
+    if (f.read(ch, 8) != 8) break;
+    const uint32_t chunk_size = le_u32(&ch[4]);
+
+    if (memcmp(ch, "fmt ", 4) == 0) {
+      uint8_t fmt[16] = {0};
+      const size_t take = min(static_cast<uint32_t>(16), chunk_size);
+      if (f.read(fmt, take) != static_cast<int>(take)) break;
+      if (chunk_size > take) f.seek(f.position() + (chunk_size - take));
+      audio_fmt = le_u16(&fmt[0]);
+      channels = le_u16(&fmt[2]);
+      sample_rate = le_u32(&fmt[4]);
+      bits = le_u16(&fmt[14]);
+    } else if (memcmp(ch, "data", 4) == 0) {
+      data_size = chunk_size;
+      data_pos = f.position();
+      break;
+    } else {
+      f.seek(f.position() + chunk_size);
+    }
+  }
+
+  if (audio_fmt != 1 || channels != 1 || bits != 16 || data_size == 0 || sample_rate < 8000 ||
+      sample_rate > 48000) {
+    f.close();
+    return false;
+  }
+
+  f.seek(data_pos);
+  i2s_set_clk(I2S_NUM_0, sample_rate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+
+  if (audio_player.playing && audio_player.file) {
+    audio_player.file.close();
+  }
+  audio_player.file = f;
+  audio_player.data_remaining = data_size;
+  audio_player.sample_rate = sample_rate;
+  audio_player.playing = true;
+  audio_player.current_file = file_name;
+  return true;
+}
+
+void audio_poll() {
+  if (!audio_player.playing || !audio_player.file) return;
+  static uint8_t buf[512];
+  const size_t to_read = min(static_cast<uint32_t>(sizeof(buf)), audio_player.data_remaining);
+  if (to_read == 0) {
+    audio_player.file.close();
+    audio_player.playing = false;
+    return;
+  }
+
+  const int n = audio_player.file.read(buf, to_read);
+  if (n <= 0) {
+    audio_player.file.close();
+    audio_player.playing = false;
+    return;
+  }
+
+  size_t written = 0;
+  i2s_write(I2S_NUM_0, buf, n, &written, 2 / portTICK_PERIOD_MS);
+  if (written < static_cast<size_t>(n)) {
+    // If DMA is busy, continue on next loop without rewinding to keep CPU light.
+  }
+  audio_player.data_remaining -= static_cast<uint32_t>(written);
+  if (audio_player.data_remaining == 0) {
+    audio_player.file.close();
+    audio_player.playing = false;
+  }
 }
 
 bool parse_uid_text(const String &uid_text, uint8_t out_uid[6]) {
@@ -318,6 +572,12 @@ void load_config() {
   config.buzzer.alarm_telem_loss_enabled = prefs.getBool("bz_t_en", true);
   config.buzzer.alarm_telem_loss_sec = prefs.getInt("bz_t_sec", 3);
   config.buzzer.alarm_telem_loss_sound = prefs.getString("bz_t_snd", "telem_lost.wav");
+  config.buzzer.alarm_board_batt_enabled = prefs.getBool("bz_bb_en", false);
+  config.buzzer.alarm_board_batt_min_pct = prefs.getInt("bz_bb_min", 30);
+  config.buzzer.alarm_board_batt_sound = prefs.getString("bz_bb_snd", "board_batt_low.wav");
+  config.buzzer.alarm_drone_batt_enabled = prefs.getBool("bz_db_en", false);
+  config.buzzer.alarm_drone_batt_min_pct = prefs.getInt("bz_db_min", 30);
+  config.buzzer.alarm_drone_batt_sound = prefs.getString("bz_db_snd", "drone_batt_low.wav");
 
   prefs.end();
 
@@ -363,6 +623,12 @@ void save_config() {
   prefs.putBool("bz_t_en", config.buzzer.alarm_telem_loss_enabled);
   prefs.putInt("bz_t_sec", config.buzzer.alarm_telem_loss_sec);
   prefs.putString("bz_t_snd", config.buzzer.alarm_telem_loss_sound);
+  prefs.putBool("bz_bb_en", config.buzzer.alarm_board_batt_enabled);
+  prefs.putInt("bz_bb_min", config.buzzer.alarm_board_batt_min_pct);
+  prefs.putString("bz_bb_snd", config.buzzer.alarm_board_batt_sound);
+  prefs.putBool("bz_db_en", config.buzzer.alarm_drone_batt_enabled);
+  prefs.putInt("bz_db_min", config.buzzer.alarm_drone_batt_min_pct);
+  prefs.putString("bz_db_snd", config.buzzer.alarm_drone_batt_sound);
 
   prefs.end();
 }
@@ -485,7 +751,7 @@ void open_log_if_needed() {
     return;
   }
 
-  active_log.println("ms,type,payload_hex,lat,lon,gps_fix,gps_sats,bat_v,bat_a,lq,rssi1,rssi2,down_rssi,down_lq,down_snr,mode");
+  active_log.println("ms,timestamp,uptime,type,payload_hex,lat,lon,gps_fix,gps_sats,bat_v,bat_a,lq,rssi1,rssi2,down_rssi,down_lq,down_snr,mode");
   active_log.flush();
   rotate_logs_if_needed();
   sd_status = "logging";
@@ -495,6 +761,11 @@ void log_frame_csv(uint8_t type, const uint8_t *payload, uint8_t payload_len) {
   if (!active_log || !should_log_type(type)) return;
 
   active_log.print(millis());
+  active_log.print(',');
+  const String ts = current_timestamp_string();
+  active_log.print(ts.isEmpty() ? "-" : ts);
+  active_log.print(',');
+  active_log.print(format_uptime(millis()));
   active_log.print(',');
   active_log.print(type);
   active_log.print(',');
@@ -554,6 +825,7 @@ void trigger_alarm(const String &name, const String &sound_file) {
   if (config.buzzer.enabled) {
     tone(BUZZER_PIN, 2400, 180);
   }
+  start_wav_playback(sound_file);
 }
 
 void check_alarms() {
@@ -566,6 +838,12 @@ void check_alarms() {
   const bool telem_bad = config.buzzer.alarm_telem_loss_enabled &&
                          (millis() - telemetry.last_frame_ms) >
                              static_cast<unsigned long>(config.buzzer.alarm_telem_loss_sec) * 1000UL;
+  const bool board_batt_bad = config.buzzer.alarm_board_batt_enabled &&
+                              telemetry.board_percent > 0 &&
+                              telemetry.board_percent < config.buzzer.alarm_board_batt_min_pct;
+  const bool drone_batt_bad = config.buzzer.alarm_drone_batt_enabled &&
+                              telemetry.battery_remaining_pct > 0 &&
+                              telemetry.battery_remaining_pct < config.buzzer.alarm_drone_batt_min_pct;
 
   if (uplink_bad && !last_alarm_uplink) {
     trigger_alarm("uplink_rssi_low", config.buzzer.alarm_uplink_sound);
@@ -579,11 +857,33 @@ void check_alarms() {
   if (telem_bad && !last_alarm_telem) {
     trigger_alarm("telemetry_lost", config.buzzer.alarm_telem_loss_sound);
   }
+  if (board_batt_bad && !last_alarm_board_batt) {
+    trigger_alarm("board_battery_low", config.buzzer.alarm_board_batt_sound);
+  }
+  if (drone_batt_bad && !last_alarm_drone_batt) {
+    trigger_alarm("drone_battery_low", config.buzzer.alarm_drone_batt_sound);
+  }
 
   last_alarm_uplink = uplink_bad;
   last_alarm_downlink = downlink_bad;
   last_alarm_lq = lq_bad;
   last_alarm_telem = telem_bad;
+  last_alarm_board_batt = board_batt_bad;
+  last_alarm_drone_batt = drone_batt_bad;
+}
+
+void update_status_led() {
+  const bool connected = (millis() - telemetry.last_frame_ms) < 2000UL && telemetry.frames_total > 0;
+  if (connected) {
+    digitalWrite(STATUS_LED_PIN, HIGH);
+    return;
+  }
+
+  if (millis() - last_led_blink_ms > 600UL) {
+    last_led_blink_ms = millis();
+    led_blink_state = !led_blink_state;
+    digitalWrite(STATUS_LED_PIN, led_blink_state ? HIGH : LOW);
+  }
 }
 
 void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
@@ -686,6 +986,15 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       if (payload_len < 2) break;
       const int16_t vario_cms = static_cast<int16_t>(read_be16(payload));
       telemetry.vario_ms = static_cast<float>(vario_cms) / 100.0f;
+      break;
+    }
+    case 0x16: {  // Time source frame (if provided by telemetry source)
+      if (payload_len >= 4) {
+        const uint32_t epoch_candidate = read_be32u(payload);
+        if (epoch_candidate > 1577836800UL && epoch_candidate < 4102444800UL) {  // 2020..2100
+          set_clock_base(static_cast<time_t>(epoch_candidate), TS_REAL, "telemetry");
+        }
+      }
       break;
     }
     default:
@@ -835,6 +1144,10 @@ String telemetry_json() {
   out += "\"sta_ip\":\"" + WiFi.localIP().toString() + "\",";
   out += "\"note\":\"" + json_escape(wifi_note) + "\"";
   out += "},";
+  out += "\"time\":{";
+  out += "\"synced\":" + String(clock_synced ? "true" : "false") + ",";
+  out += "\"source\":\"" + json_escape(clock_source_name) + "\"";
+  out += "},";
 
   out += "\"sd\":{";
   out += "\"available\":" + String(sd_available ? "true" : "false") + ",";
@@ -939,8 +1252,11 @@ String config_json() {
   out += "},";
 
   out += "\"profiles\":[";
+  bool pf_first = true;
   for (int i = 0; i < MAX_BIND_PROFILES; i++) {
-    if (i) out += ",";
+    if (profile_is_empty(config.profiles[i])) continue;
+    if (!pf_first) out += ",";
+    pf_first = false;
     out += "{";
     out += "\"index\":" + String(i) + ",";
     out += "\"note\":\"" + json_escape(config.profiles[i].note) + "\",";
@@ -973,7 +1289,13 @@ String config_json() {
   out += "\"lq_sound\":\"" + json_escape(config.buzzer.alarm_lq_sound) + "\",";
   out += "\"telem_en\":" + String(config.buzzer.alarm_telem_loss_enabled ? "true" : "false") + ",";
   out += "\"telem_sec\":" + String(config.buzzer.alarm_telem_loss_sec) + ",";
-  out += "\"telem_sound\":\"" + json_escape(config.buzzer.alarm_telem_loss_sound) + "\"";
+  out += "\"telem_sound\":\"" + json_escape(config.buzzer.alarm_telem_loss_sound) + "\",";
+  out += "\"board_batt_en\":" + String(config.buzzer.alarm_board_batt_enabled ? "true" : "false") + ",";
+  out += "\"board_batt_min\":" + String(config.buzzer.alarm_board_batt_min_pct) + ",";
+  out += "\"board_batt_sound\":\"" + json_escape(config.buzzer.alarm_board_batt_sound) + "\",";
+  out += "\"drone_batt_en\":" + String(config.buzzer.alarm_drone_batt_enabled ? "true" : "false") + ",";
+  out += "\"drone_batt_min\":" + String(config.buzzer.alarm_drone_batt_min_pct) + ",";
+  out += "\"drone_batt_sound\":\"" + json_escape(config.buzzer.alarm_drone_batt_sound) + "\"";
   out += "},";
 
   out += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"";
@@ -1041,6 +1363,91 @@ String sounds_json() {
   return out;
 }
 
+String gps_points_json() {
+  String out;
+  out.reserve(8192);
+  out += "{\"points\":[";
+
+  if (!sd_available) {
+    out += "]}";
+    return out;
+  }
+
+  File dir = SD.open("/logs");
+  String names[128];
+  int count = 0;
+  if (dir && dir.isDirectory()) {
+    File f = dir.openNextFile();
+    while (f && count < 128) {
+      if (!f.isDirectory()) names[count++] = String(f.name());
+      f = dir.openNextFile();
+    }
+  }
+  if (dir) dir.close();
+
+  for (int i = 0; i < count - 1; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (names[j] > names[i]) {
+        String t = names[i];
+        names[i] = names[j];
+        names[j] = t;
+      }
+    }
+  }
+
+  bool first = true;
+  int emitted = 0;
+  const int max_points = server.hasArg("max") ? max(1, min(200, static_cast<int>(server.arg("max").toInt()))) : 80;
+  for (int i = 0; i < count && emitted < max_points; i++) {
+    String path = names[i];
+    if (!path.startsWith("/")) path = "/" + path;
+    File f = SD.open(path.c_str(), FILE_READ);
+    if (!f) continue;
+
+    while (f.available() && emitted < max_points) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      if (line.isEmpty() || line.startsWith("ms,")) continue;
+
+      int p1 = line.indexOf(',');
+      int p2 = line.indexOf(',', p1 + 1);
+      int p3 = line.indexOf(',', p2 + 1);
+      int p4 = line.indexOf(',', p3 + 1);
+      int p5 = line.indexOf(',', p4 + 1);
+      int p6 = line.indexOf(',', p5 + 1);
+      int p7 = line.indexOf(',', p6 + 1);
+      if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0 || p5 < 0 || p6 < 0 || p7 < 0) continue;
+
+      const String ms_s = line.substring(0, p1);
+      const String ts_s = line.substring(p1 + 1, p2);
+      const String uptime_s = line.substring(p2 + 1, p3);
+      const String type_s = line.substring(p3 + 1, p4);
+      if (type_s.toInt() != 2) continue;
+      const String lat_s = line.substring(p5 + 1, p6);
+      const String lon_s = line.substring(p6 + 1, p7);
+      const double lat = lat_s.toDouble();
+      const double lon = lon_s.toDouble();
+      if (lat == 0.0 && lon == 0.0) continue;
+
+      if (!first) out += ",";
+      first = false;
+      out += "{";
+      out += "\"ms\":" + ms_s + ",";
+      out += "\"timestamp\":\"" + json_escape(ts_s) + "\",";
+      out += "\"uptime\":\"" + json_escape(uptime_s) + "\",";
+      out += "\"lat\":" + String(lat, 7) + ",";
+      out += "\"lon\":" + String(lon, 7) + ",";
+      out += "\"log\":\"" + json_escape(path) + "\"";
+      out += "}";
+      emitted++;
+    }
+    f.close();
+  }
+
+  out += "]}";
+  return out;
+}
+
 void apply_uid_to_station_mac() {
   WiFi.mode(WIFI_AP_STA);
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
@@ -1068,11 +1475,35 @@ void handle_root() {
     .ok{color:var(--ok)} .muted{color:var(--muted);font-size:12px}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
     code{white-space:pre-wrap}
+    .bar-wrap{margin:6px 0 10px}
+    .bar-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+    .emoji{font-size:20px;width:22px;text-align:center}
+    .bar{flex:1;height:14px;border-radius:8px;background:#1f2937;border:1px solid #2a3648;overflow:hidden}
+    .fill{height:100%;width:0%;transition:width .2s;background:#22c55e}
+    .fill.yellow{background:#facc15}
+    .fill.red{background:#ef4444}
+    body.alarm-flash{background:#7f1d1d !important;transition:background .15s}
+    #alarm_overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none}
+    #alarm_box{background:#111827;border:1px solid #ef4444;color:#fecaca;padding:16px 22px;border-radius:12px;font-weight:700;font-size:20px}
   </style>
 </head>
 <body>
   <h1>ELRS Backpack Panel</h1>
-  <div class="muted">API: /api/telemetry /api/config /api/logs /api/sounds</div>
+
+  <div id="alarm_overlay"><div id="alarm_box">ALARM</div></div>
+
+  <div class="bar-wrap">
+    <div class="bar-row">
+      <div class="emoji">⚙️</div>
+      <div class="bar"><div id="bar_board" class="fill"></div></div>
+      <div id="txt_board" class="muted">0%</div>
+    </div>
+    <div class="bar-row">
+      <div class="emoji">✈️</div>
+      <div class="bar"><div id="bar_drone" class="fill"></div></div>
+      <div id="txt_drone" class="muted">0%</div>
+    </div>
+  </div>
 
   <div class="tabs">
     <div class="tab active" data-tab="telemetry">Telemetry</div>
@@ -1096,33 +1527,20 @@ void handle_root() {
   <div id="bind" class="pane">
     <div class="card">
       <h3>Current Bind</h3>
+      <div class="row"><span class="k">Profile note for save</span></div>
+      <input id="bind_note" placeholder="TX #1" />
       <div class="row"><span class="k">Bind Phrase</span></div>
       <input id="bind_phrase" placeholder="your bind phrase" />
       <div class="row"><span class="k">UID Digits (6 numbers)</span></div>
       <input id="uid_text" placeholder="106,19,19,206,193,30" />
-      <div class="row"><button id="save_bind">Save Current Bind</button></div>
+      <div class="row"><button id="save_bind">Save + Apply (as profile)</button></div>
       <div class="row"><span class="k">Effective UID</span><span id="effective_uid" class="v">-</span></div>
       <div id="bind_msg" class="muted"></div>
     </div>
 
     <div class="card">
       <h3>Saved Profiles</h3>
-      <div class="muted">Each profile stores note + bind phrase + uid digits.</div>
-      <div class="row">
-        <select id="profile_index"></select>
-        <button id="load_profile">Load</button>
-      </div>
-      <div class="row"><span class="k">Note</span></div>
-      <input id="profile_note" placeholder="TX #1" />
-      <div class="row"><span class="k">Profile Bind Phrase</span></div>
-      <input id="profile_phrase" placeholder="bind phrase" />
-      <div class="row"><span class="k">Profile UID Digits</span></div>
-      <input id="profile_uid" placeholder="106,19,19,206,193,30" />
-      <div class="row">
-        <button id="save_profile">Save Profile</button>
-        <button id="apply_profile">Apply Profile</button>
-      </div>
-      <div id="profile_msg" class="muted"></div>
+      <div class="muted">Only saved profiles are shown.</div>
       <div id="profiles_list" class="muted"></div>
     </div>
   </div>
@@ -1149,8 +1567,13 @@ void handle_root() {
     </div>
 
     <div class="card">
-      <h3>Last GPS QR</h3>
-      <div class="muted">Generated from last telemetry GPS point.</div>
+      <h3>GPS QR History</h3>
+      <div class="row"><button id="btn_load_points">Load GPS Points</button></div>
+      <div class="row">
+        <button id="btn_prev_qr">Prev</button>
+        <button id="btn_next_qr">Next</button>
+      </div>
+      <div id="qr_meta" class="muted">No points loaded</div>
       <div id="qr"></div>
     </div>
   </div>
@@ -1180,8 +1603,25 @@ void handle_root() {
       <div class="row"><span class="k">Timeout sec</span><input id="bz_t_sec" type="number" value="3"></div>
       <div class="row"><span class="k">Sound file</span><select id="bz_t_snd"></select></div>
 
+      <h4>Board battery low</h4>
+      <div class="row"><span class="k">Enable</span><input id="bz_bb_en" type="checkbox" style="width:auto"></div>
+      <div class="row"><span class="k">Min %</span><input id="bz_bb_min" type="number" value="30"></div>
+      <div class="row"><span class="k">Sound file</span><select id="bz_bb_snd"></select></div>
+
+      <h4>Drone battery low</h4>
+      <div class="row"><span class="k">Enable</span><input id="bz_db_en" type="checkbox" style="width:auto"></div>
+      <div class="row"><span class="k">Min %</span><input id="bz_db_min" type="number" value="30"></div>
+      <div class="row"><span class="k">Sound file</span><select id="bz_db_snd"></select></div>
+
       <div class="row"><button id="save_bz_cfg">Save Buzzer Config</button></div>
       <div id="bz_msg" class="muted"></div>
+    </div>
+    <div class="card">
+      <h3>Sound Upload</h3>
+      <div class="muted">Upload alarm files to SD `/sound`.</div>
+      <input id="sound_file" type="file" accept=".wav,.mp3,.ogg" />
+      <div class="row"><button id="upload_sound_btn">Upload Sound</button></div>
+      <div id="upload_msg" class="muted"></div>
     </div>
   </div>
 
@@ -1191,6 +1631,8 @@ const f = (n, d = 1) => Number.isFinite(n) ? Number(n).toFixed(d) : "-";
 let cfg = null;
 let sounds = [];
 let lastAlarmId = 0;
+let gpsPoints = [];
+let gpsIdx = -1;
 
 function setTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active', t.dataset.tab===name));
@@ -1240,10 +1682,27 @@ function drawQR(gps){
   new QRCode(node, {text: txt, width: 160, height: 160});
 }
 
+function setBar(id, txtId, pct){
+  const p = Math.max(0, Math.min(100, Number(pct||0)));
+  const el = by(id);
+  el.style.width = `${p}%`;
+  el.classList.remove('yellow','red');
+  if (p < 40) el.classList.add('red');
+  else if (p < 80) el.classList.add('yellow');
+  by(txtId).textContent = `${p}%`;
+}
+
 function maybePlayAlarm(t){
   if (!t.alarm) return;
   if (t.alarm.event_id <= lastAlarmId) return;
   lastAlarmId = t.alarm.event_id;
+  document.body.classList.add('alarm-flash');
+  by('alarm_box').textContent = t.alarm.name || 'ALARM';
+  by('alarm_overlay').style.display = 'flex';
+  setTimeout(()=>{
+    document.body.classList.remove('alarm-flash');
+    by('alarm_overlay').style.display = 'none';
+  }, 1000);
   if (!t.alarm.sound) return;
   const a = new Audio(`/sound?file=${encodeURIComponent(t.alarm.sound)}`);
   a.play().catch(()=>{});
@@ -1257,8 +1716,9 @@ function drawTelemetry(t){
   by('att').innerHTML = `<h3>Attitude</h3><div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div><div class="row"><span class="k">Mode</span><span class="v">${t.flight_mode}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed}</span></div>`;
   by('sys').innerHTML = `<h3>System</h3><div class="row"><span class="k">Frames</span><span class="v">${t.frames_total}</span></div><div class="row"><span class="k">ESPNow</span><span class="v">${t.espnow.packets}</span></div><div class="row"><span class="k">No CRSF</span><span class="v">${t.espnow.no_crsf}</span></div><div class="row"><span class="k">SD</span><span class="v">${t.sd.available}</span></div><div class="row"><span class="k">SD Status</span><span class="v">${t.sd.status}</span></div><div class="row"><span class="k">Active log</span><span class="v">${t.sd.active_log}</span></div>`;
   by('sd_status').textContent = `SD: ${t.sd.status}`;
+  setBar('bar_board','txt_board', t.board_battery.percent);
+  setBar('bar_drone','txt_drone', t.battery.remaining_pct);
   drawUnknown(t.unknown_types);
-  drawQR(t.gps);
   maybePlayAlarm(t);
 }
 
@@ -1269,16 +1729,6 @@ async function loadConfig(){
   by('bind_phrase').value = cfg.bind.bind_phrase || '';
   by('uid_text').value = cfg.bind.uid_text || '';
   by('effective_uid').textContent = cfg.bind.effective_uid || '-';
-
-  const pi = by('profile_index');
-  pi.innerHTML = '';
-  for (const p of cfg.profiles){
-    const o = document.createElement('option');
-    o.value = p.index;
-    o.textContent = `#${p.index} ${p.note || '(empty)'}`;
-    pi.appendChild(o);
-  }
-  loadProfileToForm();
 
   const l = cfg.logging;
   by('log_enabled').checked = !!l.enabled;
@@ -1299,30 +1749,25 @@ async function loadConfig(){
   by('bz_lq_min').value = b.lq_min;
   by('bz_t_en').checked = !!b.telem_en;
   by('bz_t_sec').value = b.telem_sec;
+  by('bz_bb_en').checked = !!b.board_batt_en;
+  by('bz_bb_min').value = b.board_batt_min;
+  by('bz_db_en').checked = !!b.drone_batt_en;
+  by('bz_db_min').value = b.drone_batt_min;
 
   fillSoundSelect('bz_u_snd', b.uplink_sound);
   fillSoundSelect('bz_d_snd', b.down_sound);
   fillSoundSelect('bz_lq_snd', b.lq_sound);
   fillSoundSelect('bz_t_snd', b.telem_sound);
+  fillSoundSelect('bz_bb_snd', b.board_batt_sound);
+  fillSoundSelect('bz_db_snd', b.drone_batt_sound);
 
   let list = '';
   for (const p of cfg.profiles){
-    if (p.note || p.bind_phrase || p.uid_text) {
-      const diff = (p.bind_phrase !== cfg.bind.bind_phrase || p.uid_text !== cfg.bind.uid_text) ? ' (can apply)' : ' (current)';
-      list += `#${p.index} ${p.note || '-'}${diff}<br>`;
-    }
+    const isCurrent = p.bind_phrase === cfg.bind.bind_phrase && p.uid_text === cfg.bind.uid_text;
+    const state = isCurrent ? '(current)' : '';
+    list += `<div class="row"><span>#${p.index} ${p.note || '-'} ${state}</span><span><button onclick="applyProfile(${p.index})">Apply</button> <button onclick="deleteProfile(${p.index})">Delete</button></span></div>`;
   }
   by('profiles_list').innerHTML = list || 'No saved profiles';
-}
-
-function loadProfileToForm(){
-  if (!cfg) return;
-  const idx = Number(by('profile_index').value || 0);
-  const p = cfg.profiles.find(x => x.index === idx);
-  if (!p) return;
-  by('profile_note').value = p.note || '';
-  by('profile_phrase').value = p.bind_phrase || '';
-  by('profile_uid').value = p.uid_text || '';
 }
 
 async function loadSounds(){
@@ -1356,30 +1801,22 @@ async function refreshTelemetry(){
 }
 
 by('save_bind').onclick = async () => {
-  const body = new URLSearchParams({bind_phrase: by('bind_phrase').value, uid_text: by('uid_text').value});
+  const body = new URLSearchParams({bind_phrase: by('bind_phrase').value, uid_text: by('uid_text').value, note: by('bind_note').value});
   const r = await fetch('/api/bind', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
   by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
-
-by('load_profile').onclick = () => loadProfileToForm();
-
-by('save_profile').onclick = async () => {
-  const body = new URLSearchParams({
-    index: by('profile_index').value,
-    note: by('profile_note').value,
-    bind_phrase: by('profile_phrase').value,
-    uid_text: by('profile_uid').value
-  });
-  const r = await fetch('/api/profile_save', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
-  by('profile_msg').textContent = await r.text();
+window.applyProfile = async (idx) => {
+  const body = new URLSearchParams({index: String(idx)});
+  const r = await fetch('/api/profile_apply', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
-
-by('apply_profile').onclick = async () => {
-  const body = new URLSearchParams({index: by('profile_index').value});
-  const r = await fetch('/api/profile_apply', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
-  by('profile_msg').textContent = await r.text();
+window.deleteProfile = async (idx) => {
+  if (!confirm(`Delete profile #${idx}?`)) return;
+  const body = new URLSearchParams({index: String(idx)});
+  const r = await fetch('/api/profile_delete', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
 
@@ -1413,14 +1850,69 @@ by('save_bz_cfg').onclick = async () => {
     lq_snd: by('bz_lq_snd').value,
     t_en: by('bz_t_en').checked ? '1' : '0',
     t_sec: by('bz_t_sec').value,
-    t_snd: by('bz_t_snd').value
+    t_snd: by('bz_t_snd').value,
+    bb_en: by('bz_bb_en').checked ? '1' : '0',
+    bb_min: by('bz_bb_min').value,
+    bb_snd: by('bz_bb_snd').value,
+    db_en: by('bz_db_en').checked ? '1' : '0',
+    db_min: by('bz_db_min').value,
+    db_snd: by('bz_db_snd').value
   });
   const r = await fetch('/api/buzzer_cfg', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
   by('bz_msg').textContent = await r.text();
   await loadConfig();
 };
 
+by('upload_sound_btn').onclick = async () => {
+  const fi = by('sound_file');
+  if (!fi.files || !fi.files.length) {
+    by('upload_msg').textContent = 'Choose file first';
+    return;
+  }
+  const fd = new FormData();
+  fd.append('file', fi.files[0], fi.files[0].name);
+  const r = await fetch('/api/upload_sound', {method:'POST', body: fd});
+  by('upload_msg').textContent = await r.text();
+  await loadSounds();
+  await loadConfig();
+};
+
+function renderGpsPoint() {
+  const node = by('qr');
+  node.innerHTML = '';
+  if (gpsIdx < 0 || gpsIdx >= gpsPoints.length) {
+    by('qr_meta').textContent = 'No points loaded';
+    return;
+  }
+  const p = gpsPoints[gpsIdx];
+  by('qr_meta').textContent = `${gpsIdx + 1}/${gpsPoints.length} | ${p.timestamp || p.uptime} | ${p.log}`;
+  new QRCode(node, {text: `https://maps.google.com/?q=${p.lat},${p.lon}`, width: 180, height: 180});
+}
+
+by('btn_load_points').onclick = async () => {
+  const r = await fetch('/api/gps_points?max=120', {cache:'no-store'});
+  const j = await r.json();
+  gpsPoints = Array.isArray(j.points) ? j.points : [];
+  gpsIdx = gpsPoints.length ? 0 : -1;
+  renderGpsPoint();
+};
+by('btn_prev_qr').onclick = () => {
+  if (gpsIdx > 0) gpsIdx--;
+  renderGpsPoint();
+};
+by('btn_next_qr').onclick = () => {
+  if (gpsIdx >= 0 && gpsIdx < gpsPoints.length - 1) gpsIdx++;
+  renderGpsPoint();
+};
+
 (async () => {
+  try {
+    await fetch('/api/time_sync', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:new URLSearchParams({epoch: String(Math.floor(Date.now()/1000))})
+    });
+  } catch(_) {}
   await loadSounds();
   await loadConfig();
   await loadLogs();
@@ -1445,6 +1937,20 @@ void handle_api_config() {
   server.send(200, "application/json; charset=utf-8", config_json());
 }
 
+void handle_api_time_sync() {
+  if (!server.hasArg("epoch")) {
+    server.send(400, "text/plain", "missing epoch");
+    return;
+  }
+  const long long epoch = atoll(server.arg("epoch").c_str());
+  if (epoch < 946684800LL) {
+    server.send(400, "text/plain", "bad epoch");
+    return;
+  }
+  set_clock_base(static_cast<time_t>(epoch), TS_WEB, "web");
+  server.send(200, "text/plain", "time synced");
+}
+
 void handle_api_bind() {
   if (!server.hasArg("bind_phrase") || !server.hasArg("uid_text")) {
     server.send(400, "text/plain", "missing args");
@@ -1453,11 +1959,13 @@ void handle_api_bind() {
 
   config.bind_phrase = server.arg("bind_phrase");
   config.uid_text = server.arg("uid_text");
+  const String note = server.hasArg("note") ? server.arg("note") : "";
   recalc_effective_uid();
+  upsert_current_profile(note);
   save_config();
   apply_uid_to_station_mac();
 
-  server.send(200, "text/plain", "Saved current bind and applied UID.");
+  server.send(200, "text/plain", "Saved bind, profile upserted, UID applied.");
 }
 
 void handle_api_profile_save() {
@@ -1479,6 +1987,22 @@ void handle_api_profile_save() {
   save_config();
 
   server.send(200, "text/plain", "Profile saved.");
+}
+
+void handle_api_profile_delete() {
+  if (!server.hasArg("index")) {
+    server.send(400, "text/plain", "missing index");
+    return;
+  }
+  const int index = server.arg("index").toInt();
+  if (index < 0 || index >= MAX_BIND_PROFILES) {
+    server.send(400, "text/plain", "bad index");
+    return;
+  }
+
+  config.profiles[index] = BindProfile{};
+  save_config();
+  server.send(200, "text/plain", "Profile deleted.");
 }
 
 void handle_api_profile_apply() {
@@ -1534,8 +2058,9 @@ void handle_api_buzzer_cfg() {
   if (!server.hasArg("enabled") || !server.hasArg("u_en") || !server.hasArg("u_min") ||
       !server.hasArg("u_snd") || !server.hasArg("d_en") || !server.hasArg("d_min") ||
       !server.hasArg("d_snd") || !server.hasArg("lq_en") || !server.hasArg("lq_min") ||
-      !server.hasArg("lq_snd") || !server.hasArg("t_en") || !server.hasArg("t_sec") ||
-      !server.hasArg("t_snd")) {
+      !server.hasArg("lq_snd") || !server.hasArg("t_en") || !server.hasArg("t_sec") || !server.hasArg("t_snd") ||
+      !server.hasArg("bb_en") || !server.hasArg("bb_min") || !server.hasArg("bb_snd") ||
+      !server.hasArg("db_en") || !server.hasArg("db_min") || !server.hasArg("db_snd")) {
     server.send(400, "text/plain", "missing args");
     return;
   }
@@ -1558,6 +2083,12 @@ void handle_api_buzzer_cfg() {
   const int tsec = static_cast<int>(server.arg("t_sec").toInt());
   config.buzzer.alarm_telem_loss_sec = tsec < 1 ? 1 : tsec;
   config.buzzer.alarm_telem_loss_sound = server.arg("t_snd");
+  config.buzzer.alarm_board_batt_enabled = (server.arg("bb_en") == "1");
+  config.buzzer.alarm_board_batt_min_pct = server.arg("bb_min").toInt();
+  config.buzzer.alarm_board_batt_sound = server.arg("bb_snd");
+  config.buzzer.alarm_drone_batt_enabled = (server.arg("db_en") == "1");
+  config.buzzer.alarm_drone_batt_min_pct = server.arg("db_min").toInt();
+  config.buzzer.alarm_drone_batt_sound = server.arg("db_snd");
 
   save_config();
   server.send(200, "text/plain", "Buzzer config saved.");
@@ -1597,6 +2128,41 @@ void handle_log_file() {
 void handle_api_sounds() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", sounds_json());
+}
+
+void handle_api_upload_sound() {
+  static File upload_file;
+  HTTPUpload &up = server.upload();
+  if (!sd_available) return;
+
+  if (up.status == UPLOAD_FILE_START) {
+    String fn = up.filename;
+    fn.replace("\\", "");
+    fn.replace("/", "");
+    if (!fn.endsWith(".wav") && !fn.endsWith(".WAV") && !fn.endsWith(".mp3") && !fn.endsWith(".MP3") &&
+        !fn.endsWith(".ogg") && !fn.endsWith(".OGG")) {
+      return;
+    }
+    String path = "/sound/" + fn;
+    upload_file = SD.open(path.c_str(), FILE_WRITE);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (upload_file) upload_file.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+    if (upload_file) upload_file.close();
+  }
+}
+
+void handle_api_upload_sound_done() {
+  if (!sd_available) {
+    server.send(503, "text/plain", "sd not available");
+    return;
+  }
+  server.send(200, "text/plain", "upload done");
+}
+
+void handle_api_gps_points() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json; charset=utf-8", gps_points_json());
 }
 
 void handle_sound_file() {
@@ -1667,14 +2233,18 @@ void setup_web_routes() {
   server.on("/", HTTP_GET, handle_root);
   server.on("/api/telemetry", HTTP_GET, handle_api_telemetry);
   server.on("/api/config", HTTP_GET, handle_api_config);
+  server.on("/api/time_sync", HTTP_POST, handle_api_time_sync);
   server.on("/api/bind", HTTP_POST, handle_api_bind);
   server.on("/api/profile_save", HTTP_POST, handle_api_profile_save);
   server.on("/api/profile_apply", HTTP_POST, handle_api_profile_apply);
+  server.on("/api/profile_delete", HTTP_POST, handle_api_profile_delete);
   server.on("/api/log_cfg", HTTP_POST, handle_api_log_cfg);
   server.on("/api/buzzer_cfg", HTTP_POST, handle_api_buzzer_cfg);
   server.on("/api/logs", HTTP_GET, handle_api_logs);
+  server.on("/api/gps_points", HTTP_GET, handle_api_gps_points);
   server.on("/log", HTTP_GET, handle_log_file);
   server.on("/api/sounds", HTTP_GET, handle_api_sounds);
+  server.on("/api/upload_sound", HTTP_POST, handle_api_upload_sound_done, handle_api_upload_sound);
   server.on("/sound", HTTP_GET, handle_sound_file);
 
   server.on("/generate_204", HTTP_GET, handle_captive_redirect);
@@ -1695,6 +2265,8 @@ void setup() {
   delay(400);
 
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, LOW);
   analogReadResolution(12);
   pinMode(BOARD_BATTERY_ADC_PIN, INPUT);
 
@@ -1725,6 +2297,8 @@ void loop() {
   update_board_battery();
   update_logging_state();
   check_alarms();
+  audio_poll();
+  update_status_led();
 
   dns_server.processNextRequest();
   server.handleClient();

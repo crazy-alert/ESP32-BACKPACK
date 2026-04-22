@@ -6,7 +6,7 @@ ESP32 firmware for ELRS Backpack telemetry over ESP-NOW with:
 - board battery monitoring
 - SD logging with rotation and web viewer
 - buzzer alarms
-- sound file selection per alarm (web playback + buzzer trigger event)
+- sound upload/selection + playback (web + I2S to MAX98357A)
 
 ## Features
 
@@ -16,20 +16,35 @@ ESP32 firmware for ELRS Backpack telemetry over ESP-NOW with:
   - note/name
   - bind phrase
   - UID digits
-  - apply saved profile
-- Board battery voltage + percent on main page
+  - save current bind into profile automatically
+  - apply/delete saved profile
+- Top battery bars on main page:
+  - backpack battery (⚙️)
+  - drone battery (✈️)
+  - colors: `<40% red`, `<80% yellow`, `>=80% green`
+- Board battery voltage + percent on main page/card
 - SD card status on main page
 - Logs to SD:
   - start only when ARMED
   - rotation by count (`keep_files`)
   - log browser in web UI
   - configurable log channels (GPS mandatory by default)
+  - timestamps include RTC-style UTC datetime (synced from browser on panel open)
+- GPS QR from logs on demand:
+  - loaded only after button press
+  - prev/next navigation through saved GPS points from logs
 - Buzzer alarms:
   - uplink RSSI low
   - downlink RSSI low
   - LQ low
   - telemetry timeout
+  - backpack battery low
+  - drone battery low
 - Per-alarm sound file selection from `/sound` folder on SD
+- Sound upload from Buzzer tab directly to SD (`/sound`)
+- LED status:
+  - solid ON when telemetry link is active
+  - slow blink when no link
 - Unknown telemetry type list at bottom without duplicate spam (type + counter + last payload)
 
 ## Build / Upload
@@ -46,8 +61,9 @@ In ELRS Lua on transmitter:
 - `Backpack -> Telemetry -> ESPNOW`
 
 In panel Bind tab:
-- set current bind phrase or UID digits
-- optionally save multiple profiles and apply them when switching transmitters
+- set current bind phrase / UID digits / note
+- `Save + Apply` stores current bind into saved profiles
+- switch back to any saved profile with `Apply`
 
 ## Wiring
 
@@ -93,12 +109,17 @@ For passive buzzer or external driver, adapt hardware accordingly.
 
 ### 4) Audio Output via Amplifier (optional)
 
-This branch handles alarm sound file selection and web playback.
-Physical playback on external speaker/headphones depends on your audio hardware path.
+This branch supports:
+- web playback for selected alarm files
+- direct WAV playback to I2S amplifier (MAX98357A)
 
-Recommended approach for real audio output from ESP32:
-- I2S DAC/amp module (e.g. MAX98357A) + speaker
-- then map selected alarm files to your playback pipeline
+MAX98357A wiring (I2S):
+- `GPIO26` -> `BCLK`
+- `GPIO27` -> `LRC / WS`
+- `GPIO22` -> `DIN`
+- `3V3` -> `VIN`
+- `GND` -> `GND`
+- Speaker -> amp output
 
 ## Sound Files
 
@@ -110,14 +131,19 @@ Supported by web streaming endpoint:
 - `.mp3`
 - `.ogg`
 
-Recommended for stable low-power alarm set:
-- mono WAV, 16-bit PCM, 16kHz or 22.05kHz
+For direct ESP32 -> MAX98357A playback currently use:
+- WAV PCM, mono, 16-bit
+- sample rate 8k..48k (practical recommended: 16k or 22.05k)
 
 ## Logging Behavior
 
 - logging only starts when flight mode indicates ARM
 - logging stops automatically when disarmed
 - rotation removes oldest files when count exceeds `keep_files`
+- each row includes:
+  - `ms` (device millis)
+  - `timestamp` (UTC ISO, synced from browser)
+  - `uptime`
 - channel selection configurable in Logging tab:
   - GPS
   - Link
@@ -129,17 +155,22 @@ Recommended for stable low-power alarm set:
 
 - `GET /api/telemetry`
 - `GET /api/config`
+- `POST /api/time_sync` (`epoch`)
 - `POST /api/bind`
 - `POST /api/profile_save`
 - `POST /api/profile_apply`
+- `POST /api/profile_delete`
 - `POST /api/log_cfg`
 - `POST /api/buzzer_cfg`
 - `GET /api/logs`
 - `GET /log?name=/logs/log_xxxxxx.csv`
+- `GET /api/gps_points?max=120`
 - `GET /api/sounds`
+- `POST /api/upload_sound` (multipart form-data)
 - `GET /sound?file=<name>`
 
 ## Notes
 
 - `STA disconnected` is expected in AP-only mode.
 - Unknown telemetry section intentionally aggregates by type and count to avoid repeated spam.
+- Time sync for RTC-like timestamps is done from browser when panel opens; if not synced, timestamp field is `-`.
