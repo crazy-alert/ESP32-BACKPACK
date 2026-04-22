@@ -18,6 +18,7 @@ constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint8_t CRSF_MAX_FRAME_LEN = 64;
 constexpr uint8_t ESPNOW_MAX_PAYLOAD = 250;
 constexpr uint8_t MAX_BIND_PROFILES = 8;
+constexpr uint32_t DRONE_TELEMETRY_STALE_MS = 3000;
 
 // Power input monitoring (use resistor divider for external battery -> ADC pin).
 constexpr int BOARD_BATTERY_ADC_PIN = 34;
@@ -85,6 +86,7 @@ struct TelemetryData {
   uint32_t crc_errors = 0;
   uint32_t unknown_frames = 0;
   uint32_t last_frame_ms = 0;
+  uint32_t last_drone_telem_ms = 0;
 
   uint32_t espnow_packets = 0;
   uint32_t espnow_drop_short = 0;
@@ -836,7 +838,8 @@ void check_alarms() {
   const bool lq_bad = config.buzzer.alarm_lq_enabled &&
                       telemetry.link_quality < config.buzzer.alarm_lq_min;
   const bool telem_bad = config.buzzer.alarm_telem_loss_enabled &&
-                         (millis() - telemetry.last_frame_ms) >
+                         telemetry.last_drone_telem_ms > 0 &&
+                         (millis() - telemetry.last_drone_telem_ms) >
                              static_cast<unsigned long>(config.buzzer.alarm_telem_loss_sec) * 1000UL;
   const bool board_batt_bad = config.buzzer.alarm_board_batt_enabled &&
                               telemetry.board_percent > 0 &&
@@ -907,9 +910,10 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
   const uint8_t type = frame[2];
   const uint8_t payload_len = static_cast<uint8_t>(len - 4);
   const uint8_t *payload = &frame[3];
+  const uint32_t now_ms = millis();
 
   telemetry.frames_total++;
-  telemetry.last_frame_ms = millis();
+  telemetry.last_frame_ms = now_ms;
   frame_stats[type].count++;
   frame_stats[type].last_payload_len = payload_len;
   frame_stats[type].last_payload_hex = bytes_to_hex(payload, payload_len);
@@ -933,6 +937,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.gps_altitude_m = static_cast<int>(altitude) - 1000;
       telemetry.gps_sats = sats;
       telemetry.gps_fix = (sats > 0);
+      telemetry.last_drone_telem_ms = now_ms;
       break;
     }
     case 0x08: {
@@ -946,6 +951,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.battery_current = static_cast<float>(c) / 10.0f;
       telemetry.battery_capacity_mah = mah;
       telemetry.battery_remaining_pct = rem;
+      telemetry.last_drone_telem_ms = now_ms;
       break;
     }
     case 0x14: {
@@ -971,6 +977,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.attitude_pitch_deg = (static_cast<float>(pitch) / 10000.0f) * kRadToDeg;
       telemetry.attitude_roll_deg = (static_cast<float>(roll) / 10000.0f) * kRadToDeg;
       telemetry.attitude_yaw_deg = (static_cast<float>(yaw) / 10000.0f) * kRadToDeg;
+      telemetry.last_drone_telem_ms = now_ms;
       break;
     }
     case 0x21: {
@@ -980,12 +987,14 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       memcpy(buf, payload, copy_len);
       telemetry.flight_mode = String(buf);
       update_armed_state();
+      telemetry.last_drone_telem_ms = now_ms;
       break;
     }
     case 0x07: {
       if (payload_len < 2) break;
       const int16_t vario_cms = static_cast<int16_t>(read_be16(payload));
       telemetry.vario_ms = static_cast<float>(vario_cms) / 100.0f;
+      telemetry.last_drone_telem_ms = now_ms;
       break;
     }
     case 0x16: {  // Time source frame (if provided by telemetry source)
@@ -1128,6 +1137,15 @@ String telemetry_json() {
   out += "{";
   out += "\"uptime_ms\":" + String(millis()) + ",";
   out += "\"last_frame_ms\":" + String(telemetry.last_frame_ms) + ",";
+  out += "\"last_drone_telem_ms\":" + String(telemetry.last_drone_telem_ms) + ",";
+  const uint32_t drone_age_ms = telemetry.last_drone_telem_ms == 0
+                                    ? 0
+                                    : static_cast<uint32_t>(millis() - telemetry.last_drone_telem_ms);
+  const bool drone_telem_active = telemetry.last_drone_telem_ms > 0 && drone_age_ms <= DRONE_TELEMETRY_STALE_MS;
+  out += "\"drone_telem\":{";
+  out += "\"active\":" + String(drone_telem_active ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(drone_age_ms);
+  out += "},";
   out += "\"frames_total\":" + String(telemetry.frames_total) + ",";
   out += "\"crc_errors\":" + String(telemetry.crc_errors) + ",";
   out += "\"unknown_frames\":" + String(telemetry.unknown_frames) + ",";
@@ -1637,7 +1655,6 @@ void handle_root() {
 <script>
 const by = id => document.getElementById(id);
 const f = (n, d = 1) => Number.isFinite(n) ? Number(n).toFixed(d) : "-";
-const TELEMETRY_STALE_MS = 3000;
 let cfg = null;
 let sounds = [];
 let lastAlarmId = 0;
@@ -1723,28 +1740,35 @@ function maybePlayAlarm(t){
 }
 
 function setStaleView(isStale){
-  ['gps','bat','link','att','unknown'].forEach(id => {
+  ['gps','link','att'].forEach(id => {
     by(id).classList.toggle('telemetry-stale', isStale);
+  });
+  document.querySelectorAll('.drone-only').forEach(el => {
+    el.classList.toggle('telemetry-stale', isStale);
   });
   by('drone_bar_row').classList.toggle('telemetry-stale', isStale);
 }
 
 function drawTelemetry(t){
-  const ageMs = Math.max(0, Number(t.uptime_ms || 0) - Number(t.last_frame_ms || 0));
+  const ageMs = Number((t.drone_telem && t.drone_telem.age_ms) || 0);
+  const hasDroneTelem = Number(t.last_drone_telem_ms || 0) > 0;
+  const isStale = hasDroneTelem && !(t.drone_telem && t.drone_telem.active);
   const hasFrames = Number(t.frames_total || 0) > 0;
-  const isStale = hasFrames && ageMs > TELEMETRY_STALE_MS;
-  if (!hasFrames) {
-    by('state').textContent = 'No telemetry yet';
+  if (!hasFrames && !hasDroneTelem) {
+    by('state').textContent = 'No telemetry yet (waiting TX stream)';
+    by('state').className = 'warn';
+  } else if (!hasDroneTelem) {
+    by('state').textContent = 'No drone telemetry yet';
     by('state').className = 'warn';
   } else if (isStale) {
-    by('state').textContent = `Telemetry stale (${(ageMs / 1000).toFixed(1)} s since last frame)`;
+    by('state').textContent = `Drone telemetry stale (${(ageMs / 1000).toFixed(1)} s since last drone frame)`;
     by('state').className = 'warn';
   } else {
-    by('state').textContent = 'Telemetry active';
+    by('state').textContent = 'Drone telemetry active';
     by('state').className = 'ok';
   }
   by('gps').innerHTML = `<h3>GPS</h3><div class="row"><span class="k">Fix</span><span class="v">${t.gps.fix}</span></div><div class="row"><span class="k">Sats</span><span class="v">${t.gps.sats}</span></div><div class="row"><span class="k">Lat</span><span class="v">${f(t.gps.lat,7)}</span></div><div class="row"><span class="k">Lon</span><span class="v">${f(t.gps.lon,7)}</span></div><div class="row"><span class="k">Speed</span><span class="v">${f(t.gps.speed_kmh)} km/h</span></div>`;
-  by('bat').innerHTML = `<h3>Battery</h3><div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${f(t.board_battery.voltage,2)} V</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.percent} %</span></div>`;
+  by('bat').innerHTML = `<h3>Battery</h3><div class="drone-only"><div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div></div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${f(t.board_battery.voltage,2)} V</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.percent} %</span></div>`;
   by('link').innerHTML = `<h3>Link</h3><div class="row"><span class="k">RSSI1</span><span class="v">${t.link.rssi1_dbm} dBm</span></div><div class="row"><span class="k">RSSI2</span><span class="v">${t.link.rssi2_dbm} dBm</span></div><div class="row"><span class="k">LQ</span><span class="v">${t.link.lq}</span></div><div class="row"><span class="k">SNR</span><span class="v">${t.link.snr_db} dB</span></div><div class="row"><span class="k">Active Ant</span><span class="v">${t.link.active_antenna}</span></div><div class="row"><span class="k">Down RSSI</span><span class="v">${t.link.down_rssi_dbm} dBm</span></div><div class="row"><span class="k">Down LQ</span><span class="v">${t.link.down_lq}</span></div><div class="row"><span class="k">Down SNR</span><span class="v">${t.link.down_snr_db} dB</span></div>`;
   by('att').innerHTML = `<h3>Attitude</h3><div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div><div class="row"><span class="k">Mode</span><span class="v">${t.flight_mode}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed}</span></div>`;
   by('sys').innerHTML = `<h3>System</h3><div class="row"><span class="k">Frames</span><span class="v">${t.frames_total}</span></div><div class="row"><span class="k">ESPNow</span><span class="v">${t.espnow.packets}</span></div><div class="row"><span class="k">No CRSF</span><span class="v">${t.espnow.no_crsf}</span></div><div class="row"><span class="k">SD</span><span class="v">${t.sd.available}</span></div><div class="row"><span class="k">SD Status</span><span class="v">${t.sd.status}</span></div><div class="row"><span class="k">Active log</span><span class="v">${t.sd.active_log}</span></div>`;
