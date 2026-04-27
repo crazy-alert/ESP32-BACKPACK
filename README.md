@@ -19,8 +19,8 @@ ESP32 firmware for ELRS Backpack telemetry over ESP-NOW with:
   - save current bind into profile automatically
   - apply/delete saved profile
 - Top battery bars on main page:
-  - backpack battery (⚙️)
-  - drone battery (✈️)
+  - backpack battery
+  - drone battery
   - colors: `<40% red`, `<80% yellow`, `>=80% green`
 - Board battery voltage + percent on main page/card
 - SD card status on main page

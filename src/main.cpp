@@ -17,8 +17,10 @@ constexpr char AP_PASSWORD[] = "12345678";
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint8_t CRSF_MAX_FRAME_LEN = 64;
 constexpr uint8_t ESPNOW_MAX_PAYLOAD = 250;
+constexpr uint8_t ESPNOW_QUEUE_DEPTH = 8;
 constexpr uint8_t MAX_BIND_PROFILES = 8;
 constexpr uint32_t DRONE_TELEMETRY_STALE_MS = 3000;
+constexpr bool DEBUG_CRSF_FRAMES = false;
 
 // Power input monitoring (use resistor divider for external battery -> ADC pin).
 constexpr int BOARD_BATTERY_ADC_PIN = 34;
@@ -91,6 +93,7 @@ struct TelemetryData {
   uint32_t espnow_packets = 0;
   uint32_t espnow_drop_short = 0;
   uint32_t espnow_drop_long = 0;
+  uint32_t espnow_drop_queue = 0;
   uint32_t espnow_no_crsf = 0;
 };
 
@@ -162,9 +165,14 @@ DNSServer dns_server;
 Preferences prefs;
 SPIClass sd_spi(VSPI);
 
-volatile bool espnow_frame_ready = false;
-volatile uint8_t espnow_frame_len = 0;
-uint8_t espnow_frame[ESPNOW_MAX_PAYLOAD] = {0};
+portMUX_TYPE espnow_queue_mux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint8_t espnow_queue_head = 0;
+volatile uint8_t espnow_queue_tail = 0;
+volatile uint8_t espnow_queue_count = 0;
+uint8_t espnow_queue_len[ESPNOW_QUEUE_DEPTH] = {0};
+uint8_t espnow_queue[ESPNOW_QUEUE_DEPTH][ESPNOW_MAX_PAYLOAD] = {};
+bool espnow_ready = false;
+bool espnow_restart_pending = false;
 
 bool sd_available = false;
 String sd_status = "not initialized";
@@ -463,9 +471,13 @@ void audio_poll() {
   }
 
   size_t written = 0;
-  i2s_write(I2S_NUM_0, buf, n, &written, 2 / portTICK_PERIOD_MS);
-  if (written < static_cast<size_t>(n)) {
-    // If DMA is busy, continue on next loop without rewinding to keep CPU light.
+  const TickType_t timeout_ticks = pdMS_TO_TICKS(20);
+  esp_err_t err = i2s_write(I2S_NUM_0, buf, n, &written, timeout_ticks);
+  if (err != ESP_OK || written != static_cast<size_t>(n)) {
+    audio_player.file.close();
+    audio_player.playing = false;
+    audio_player.data_remaining = 0;
+    return;
   }
   audio_player.data_remaining -= static_cast<uint32_t>(written);
   if (audio_player.data_remaining == 0) {
@@ -650,6 +662,7 @@ bool should_log_type(uint8_t type) {
 }
 
 void serial_log_frame(uint8_t type, const uint8_t *payload, uint8_t payload_len) {
+  if (!DEBUG_CRSF_FRAMES) return;
   Serial.printf("[CRSF] type=0x%02X payload=%u\n", type, payload_len);
   Serial.printf("       data=%s\n", bytes_to_hex(payload, payload_len).c_str());
 }
@@ -799,7 +812,11 @@ void log_frame_csv(uint8_t type, const uint8_t *payload, uint8_t payload_len) {
   active_log.print(',');
   active_log.print(telemetry.link_down_snr_db);
   active_log.print(',');
-  active_log.println(telemetry.flight_mode);
+  String mode = telemetry.flight_mode;
+  mode.replace("\"", "\"\"");
+  active_log.print('"');
+  active_log.print(mode);
+  active_log.println('"');
 
   if (millis() - last_log_flush_ms > 1000) {
     active_log.flush();
@@ -1036,61 +1053,83 @@ bool is_valid_crsf_frame(const uint8_t *frame, uint8_t len) {
 
 void on_espnow_recv(const uint8_t *mac, const uint8_t *incoming_data, int len) {
   (void)mac;
-  telemetry.espnow_packets++;
 
   if (len <= 0) {
+    portENTER_CRITICAL(&espnow_queue_mux);
+    telemetry.espnow_packets++;
     telemetry.espnow_drop_short++;
+    portEXIT_CRITICAL(&espnow_queue_mux);
     return;
   }
 
   if (len > ESPNOW_MAX_PAYLOAD) {
+    portENTER_CRITICAL(&espnow_queue_mux);
+    telemetry.espnow_packets++;
     telemetry.espnow_drop_long++;
+    portEXIT_CRITICAL(&espnow_queue_mux);
     return;
   }
 
-  memcpy(espnow_frame, incoming_data, len);
-  espnow_frame_len = static_cast<uint8_t>(len);
-  espnow_frame_ready = true;
+  portENTER_CRITICAL(&espnow_queue_mux);
+  telemetry.espnow_packets++;
+  if (espnow_queue_count >= ESPNOW_QUEUE_DEPTH) {
+    telemetry.espnow_drop_queue++;
+    portEXIT_CRITICAL(&espnow_queue_mux);
+    return;
+  }
+
+  const uint8_t slot = espnow_queue_head;
+  memcpy(espnow_queue[slot], incoming_data, len);
+  espnow_queue_len[slot] = static_cast<uint8_t>(len);
+  espnow_queue_head = static_cast<uint8_t>((espnow_queue_head + 1) % ESPNOW_QUEUE_DEPTH);
+  espnow_queue_count++;
+  portEXIT_CRITICAL(&espnow_queue_mux);
 }
 
 void process_espnow_queue() {
-  if (!espnow_frame_ready) {
-    return;
-  }
+  while (true) {
+    uint8_t len = 0;
+    uint8_t local[ESPNOW_MAX_PAYLOAD] = {0};
 
-  noInterrupts();
-  const uint8_t len = espnow_frame_len;
-  uint8_t local[ESPNOW_MAX_PAYLOAD] = {0};
-  memcpy(local, espnow_frame, len);
-  espnow_frame_ready = false;
-  interrupts();
+    portENTER_CRITICAL(&espnow_queue_mux);
+    if (espnow_queue_count == 0) {
+      portEXIT_CRITICAL(&espnow_queue_mux);
+      return;
+    }
+    const uint8_t slot = espnow_queue_tail;
+    len = espnow_queue_len[slot];
+    memcpy(local, espnow_queue[slot], len);
+    espnow_queue_tail = static_cast<uint8_t>((espnow_queue_tail + 1) % ESPNOW_QUEUE_DEPTH);
+    espnow_queue_count--;
+    portEXIT_CRITICAL(&espnow_queue_mux);
 
-  bool parsed_any = false;
-  for (uint8_t i = 0; i + 4 <= len; i++) {
-    const uint8_t sync = local[i];
-    if (sync != 0xC8 && sync != 0xEE) {
-      continue;
+    bool parsed_any = false;
+    for (uint8_t i = 0; i + 4 <= len; i++) {
+      const uint8_t sync = local[i];
+      if (sync != 0xC8 && sync != 0xEE) {
+        continue;
+      }
+
+      const uint8_t declared = local[i + 1];
+      const uint8_t total = static_cast<uint8_t>(declared + 2);
+      if (total < 4 || total > CRSF_MAX_FRAME_LEN) {
+        continue;
+      }
+      if (i + total > len) {
+        continue;
+      }
+      if (!is_valid_crsf_frame(&local[i], total)) {
+        continue;
+      }
+
+      parse_crsf_frame(&local[i], total);
+      parsed_any = true;
+      i = static_cast<uint8_t>(i + total - 1);
     }
 
-    const uint8_t declared = local[i + 1];
-    const uint8_t total = static_cast<uint8_t>(declared + 2);
-    if (total < 4 || total > CRSF_MAX_FRAME_LEN) {
-      continue;
+    if (!parsed_any) {
+      telemetry.espnow_no_crsf++;
     }
-    if (i + total > len) {
-      continue;
-    }
-    if (!is_valid_crsf_frame(&local[i], total)) {
-      continue;
-    }
-
-    parse_crsf_frame(&local[i], total);
-    parsed_any = true;
-    i = static_cast<uint8_t>(i + total - 1);
-  }
-
-  if (!parsed_any) {
-    telemetry.espnow_no_crsf++;
   }
 }
 
@@ -1154,6 +1193,7 @@ String telemetry_json() {
   out += "\"packets\":" + String(telemetry.espnow_packets) + ",";
   out += "\"drop_short\":" + String(telemetry.espnow_drop_short) + ",";
   out += "\"drop_long\":" + String(telemetry.espnow_drop_long) + ",";
+  out += "\"drop_queue\":" + String(telemetry.espnow_drop_queue) + ",";
   out += "\"no_crsf\":" + String(telemetry.espnow_no_crsf);
   out += "},";
 
@@ -1469,10 +1509,49 @@ String gps_points_json() {
   return out;
 }
 
-void apply_uid_to_station_mac() {
+bool apply_uid_to_station_mac() {
   WiFi.mode(WIFI_AP_STA);
-  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_mac(WIFI_IF_STA, config.uid);
+  if (esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+    return false;
+  }
+  return esp_wifi_set_mac(WIFI_IF_STA, config.uid) == ESP_OK;
+}
+
+bool is_safe_log_path(const String &name) {
+  if (!name.startsWith("/logs/")) return false;
+  if (name.indexOf("..") >= 0 || name.indexOf('\\') >= 0) return false;
+  const int leaf = name.lastIndexOf('/');
+  if (leaf != 5 || leaf == static_cast<int>(name.length()) - 1) return false;
+  return name.endsWith(".csv");
+}
+
+bool init_espnow_for_elrs();
+
+bool restart_espnow_for_elrs() {
+  if (espnow_ready) {
+    esp_now_deinit();
+    espnow_ready = false;
+  }
+
+  portENTER_CRITICAL(&espnow_queue_mux);
+  espnow_queue_head = 0;
+  espnow_queue_tail = 0;
+  espnow_queue_count = 0;
+  portEXIT_CRITICAL(&espnow_queue_mux);
+
+  return init_espnow_for_elrs();
+}
+
+void schedule_espnow_restart() {
+  espnow_restart_pending = true;
+}
+
+void service_pending_espnow_restart() {
+  if (!espnow_restart_pending) return;
+  espnow_restart_pending = false;
+  if (!restart_espnow_for_elrs()) {
+    Serial.println("scheduled ESP-NOW restart failed");
+  }
 }
 
 void handle_root() {
@@ -1655,6 +1734,7 @@ void handle_root() {
 <script>
 const by = id => document.getElementById(id);
 const f = (n, d = 1) => Number.isFinite(n) ? Number(n).toFixed(d) : "-";
+const h = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let cfg = null;
 let sounds = [];
 let lastAlarmId = 0;
@@ -1693,7 +1773,7 @@ function drawUnknown(arr){
   } else {
     for (const u of arr){
       html += `<div class="row"><span class="k">0x${Number(u.type).toString(16).toUpperCase().padStart(2,'0')}</span><span class="v">count ${u.count}</span></div>`;
-      html += `<div class="muted">${u.last_hex}</div>`;
+      html += `<div class="muted">${h(u.last_hex)}</div>`;
     }
   }
   by('unknown').innerHTML = html;
@@ -1707,7 +1787,14 @@ function drawQR(gps){
     return;
   }
   const txt = `https://maps.google.com/?q=${gps.lat},${gps.lon}`;
-  new QRCode(node, {text: txt, width: 160, height: 160});
+  if (typeof QRCode === 'function') {
+    new QRCode(node, {text: txt, width: 160, height: 160});
+  } else {
+    const a = document.createElement('a');
+    a.href = txt;
+    a.textContent = txt;
+    node.appendChild(a);
+  }
 }
 
 function setBar(id, txtId, pct){
@@ -1770,8 +1857,8 @@ function drawTelemetry(t){
   by('gps').innerHTML = `<h3>GPS</h3><div class="row"><span class="k">Fix</span><span class="v">${t.gps.fix}</span></div><div class="row"><span class="k">Sats</span><span class="v">${t.gps.sats}</span></div><div class="row"><span class="k">Lat</span><span class="v">${f(t.gps.lat,7)}</span></div><div class="row"><span class="k">Lon</span><span class="v">${f(t.gps.lon,7)}</span></div><div class="row"><span class="k">Speed</span><span class="v">${f(t.gps.speed_kmh)} km/h</span></div>`;
   by('bat').innerHTML = `<h3>Battery</h3><div class="drone-only"><div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div></div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${f(t.board_battery.voltage,2)} V</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.percent} %</span></div>`;
   by('link').innerHTML = `<h3>Link</h3><div class="row"><span class="k">RSSI1</span><span class="v">${t.link.rssi1_dbm} dBm</span></div><div class="row"><span class="k">RSSI2</span><span class="v">${t.link.rssi2_dbm} dBm</span></div><div class="row"><span class="k">LQ</span><span class="v">${t.link.lq}</span></div><div class="row"><span class="k">SNR</span><span class="v">${t.link.snr_db} dB</span></div><div class="row"><span class="k">Active Ant</span><span class="v">${t.link.active_antenna}</span></div><div class="row"><span class="k">Down RSSI</span><span class="v">${t.link.down_rssi_dbm} dBm</span></div><div class="row"><span class="k">Down LQ</span><span class="v">${t.link.down_lq}</span></div><div class="row"><span class="k">Down SNR</span><span class="v">${t.link.down_snr_db} dB</span></div>`;
-  by('att').innerHTML = `<h3>Attitude</h3><div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div><div class="row"><span class="k">Mode</span><span class="v">${t.flight_mode}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed}</span></div>`;
-  by('sys').innerHTML = `<h3>System</h3><div class="row"><span class="k">Frames</span><span class="v">${t.frames_total}</span></div><div class="row"><span class="k">ESPNow</span><span class="v">${t.espnow.packets}</span></div><div class="row"><span class="k">No CRSF</span><span class="v">${t.espnow.no_crsf}</span></div><div class="row"><span class="k">SD</span><span class="v">${t.sd.available}</span></div><div class="row"><span class="k">SD Status</span><span class="v">${t.sd.status}</span></div><div class="row"><span class="k">Active log</span><span class="v">${t.sd.active_log}</span></div>`;
+  by('att').innerHTML = `<h3>Attitude</h3><div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div><div class="row"><span class="k">Mode</span><span class="v">${h(t.flight_mode)}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed}</span></div>`;
+  by('sys').innerHTML = `<h3>System</h3><div class="row"><span class="k">Frames</span><span class="v">${t.frames_total}</span></div><div class="row"><span class="k">ESPNow</span><span class="v">${t.espnow.packets}</span></div><div class="row"><span class="k">Queue Drop</span><span class="v">${t.espnow.drop_queue}</span></div><div class="row"><span class="k">No CRSF</span><span class="v">${t.espnow.no_crsf}</span></div><div class="row"><span class="k">SD</span><span class="v">${t.sd.available}</span></div><div class="row"><span class="k">SD Status</span><span class="v">${h(t.sd.status)}</span></div><div class="row"><span class="k">Active log</span><span class="v">${h(t.sd.active_log)}</span></div>`;
   by('sd_status').textContent = `SD: ${t.sd.status}`;
   setBar('bar_board','txt_board', t.board_battery.percent);
   setBar('bar_drone','txt_drone', t.battery.remaining_pct);
@@ -1823,7 +1910,7 @@ async function loadConfig(){
   for (const p of cfg.profiles){
     const isCurrent = p.bind_phrase === cfg.bind.bind_phrase && p.uid_text === cfg.bind.uid_text;
     const state = isCurrent ? '(current)' : '';
-    list += `<div class="row"><span>#${p.index} ${p.note || '-'} ${state}</span><span><button onclick="applyProfile(${p.index})">Apply</button> <button onclick="deleteProfile(${p.index})">Delete</button></span></div>`;
+    list += `<div class="row"><span>#${p.index} ${h(p.note || '-')} ${state}</span><span><button onclick="applyProfile(${p.index})">Apply</button> <button onclick="deleteProfile(${p.index})">Delete</button></span></div>`;
   }
   by('profiles_list').innerHTML = list || 'No saved profiles';
 }
@@ -1841,11 +1928,11 @@ async function loadLogs(){
     by('logs_list').innerHTML = 'No logs';
     return;
   }
-  by('logs_list').innerHTML = j.files.map(f=>`<div class="row"><span>${f.name} (${f.size}B)</span><button onclick="viewLog('${f.name}')">View</button></div>`).join('');
+  by('logs_list').innerHTML = j.files.map(f=>`<div class="row"><span>${h(f.name)} (${f.size}B)</span><button onclick="viewLog('${encodeURIComponent(f.name)}')">View</button></div>`).join('');
 }
 
 async function viewLog(name){
-  const r = await fetch(`/log?name=${encodeURIComponent(name)}`);
+  const r = await fetch(`/log?name=${name}`);
   by('log_preview').textContent = (await r.text()).slice(-6000);
 }
 window.viewLog = viewLog;
@@ -1944,7 +2031,15 @@ function renderGpsPoint() {
   }
   const p = gpsPoints[gpsIdx];
   by('qr_meta').textContent = `${gpsIdx + 1}/${gpsPoints.length} | ${p.timestamp || p.uptime} | ${p.log}`;
-  new QRCode(node, {text: `https://maps.google.com/?q=${p.lat},${p.lon}`, width: 180, height: 180});
+  const txt = `https://maps.google.com/?q=${p.lat},${p.lon}`;
+  if (typeof QRCode === 'function') {
+    new QRCode(node, {text: txt, width: 180, height: 180});
+  } else {
+    const a = document.createElement('a');
+    a.href = txt;
+    a.textContent = txt;
+    node.appendChild(a);
+  }
 }
 
 by('btn_load_points').onclick = async () => {
@@ -2021,7 +2116,7 @@ void handle_api_bind() {
   recalc_effective_uid();
   upsert_current_profile(note);
   save_config();
-  apply_uid_to_station_mac();
+  schedule_espnow_restart();
 
   server.send(200, "text/plain", "Saved bind, profile upserted, UID applied.");
 }
@@ -2085,7 +2180,7 @@ void handle_api_profile_apply() {
   config.uid_text = p.uid_text;
   recalc_effective_uid();
   save_config();
-  apply_uid_to_station_mac();
+  schedule_espnow_restart();
 
   server.send(200, "text/plain", "Profile applied.");
 }
@@ -2169,7 +2264,7 @@ void handle_log_file() {
 
   String name = server.arg("name");
   if (!name.startsWith("/")) name = "/" + name;
-  if (!name.startsWith("/logs/")) {
+  if (!is_safe_log_path(name)) {
     server.send(400, "text/plain", "bad path");
     return;
   }
@@ -2266,8 +2361,14 @@ void handle_not_found() {
 }
 
 bool init_espnow_for_elrs() {
-  apply_uid_to_station_mac();
-  WiFi.softAP(AP_SSID, AP_PASSWORD, WIFI_CHANNEL);
+  if (!apply_uid_to_station_mac()) {
+    Serial.println("failed to apply ELRS UID as STA MAC");
+    return false;
+  }
+  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, WIFI_CHANNEL)) {
+    Serial.println("softAP start failed");
+    return false;
+  }
 
   dns_server.start(53, "*", WiFi.softAPIP());
 
@@ -2282,8 +2383,14 @@ bool init_espnow_for_elrs() {
   memcpy(peer_info.peer_addr, config.uid, 6);
   peer_info.channel = WIFI_CHANNEL;
   peer_info.encrypt = false;
-  esp_now_add_peer(&peer_info);
+  const esp_err_t peer_err = esp_now_add_peer(&peer_info);
+  if (peer_err != ESP_OK && peer_err != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("esp_now_add_peer failed: %d\n", static_cast<int>(peer_err));
+    esp_now_deinit();
+    return false;
+  }
 
+  espnow_ready = true;
   return true;
 }
 
@@ -2360,4 +2467,5 @@ void loop() {
 
   dns_server.processNextRequest();
   server.handleClient();
+  service_pending_espnow_restart();
 }
