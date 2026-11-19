@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "qr_code.h"
+#include "reset_button_policy.h"
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -23,6 +24,8 @@ constexpr uint8_t ESPNOW_QUEUE_DEPTH = 8;
 constexpr uint8_t MAX_BIND_PROFILES = 8;
 constexpr uint32_t DRONE_TELEMETRY_STALE_MS = 3000;
 constexpr bool DEBUG_CRSF_FRAMES = false;
+constexpr int RESET_BUTTON_PIN = 0;  // ESP32 DevKit BOOT, active low
+constexpr uint32_t RESET_BUTTON_DEBOUNCE_MS = 50;
 
 // Power input monitoring (use resistor divider for external battery -> ADC pin).
 constexpr int BOARD_BATTERY_ADC_PIN = 34;
@@ -197,6 +200,10 @@ String last_alarm_sound;
 unsigned long last_alarm_ms = 0;
 unsigned long last_led_blink_ms = 0;
 bool led_blink_state = false;
+reset_button::State reset_button_state;
+bool reset_button_raw = false;
+bool reset_button_stable = false;
+uint32_t reset_button_changed_ms = 0;
 
 struct AudioPlayer {
   bool i2s_ready = false;
@@ -915,6 +922,10 @@ void check_alarms() {
 }
 
 void update_status_led() {
+  if (reset_button_state.phase == reset_button::Phase::Ready) {
+    digitalWrite(STATUS_LED_PIN, (millis() / 150U) % 2U ? HIGH : LOW);
+    return;
+  }
   const bool connected = (millis() - telemetry.last_frame_ms) < 2000UL && telemetry.frames_total > 0;
   if (connected) {
     digitalWrite(STATUS_LED_PIN, HIGH);
@@ -926,6 +937,41 @@ void update_status_led() {
     led_blink_state = !led_blink_state;
     digitalWrite(STATUS_LED_PIN, led_blink_state ? HIGH : LOW);
   }
+}
+
+void update_reset_button() {
+  const uint32_t now = millis();
+  const bool pressed = digitalRead(RESET_BUTTON_PIN) == LOW;
+  if (pressed != reset_button_raw) {
+    reset_button_raw = pressed;
+    reset_button_changed_ms = now;
+  }
+  if (reset_button_stable != reset_button_raw &&
+      static_cast<uint32_t>(now - reset_button_changed_ms) >= RESET_BUTTON_DEBOUNCE_MS) {
+    reset_button_stable = reset_button_raw;
+  }
+  const reset_button::Phase previous = reset_button_state.phase;
+  reset_button_state = reset_button::step(reset_button_state, reset_button_stable, now);
+  if (previous != reset_button::Phase::Ready && reset_button_state.phase == reset_button::Phase::Ready) {
+    Serial.println("Wi-Fi reset ready: release BOOT to reset password and restart");
+  }
+  if (reset_button_state.phase != reset_button::Phase::Fire) return;
+
+  // Preserve all other NVS namespaces and settings. Only replace the AP password.
+  bool saved = false;
+  if (prefs.begin("backpack-ap", false)) {
+    saved = prefs.putString("password", DEFAULT_AP_PASSWORD) > 0 &&
+            prefs.getString("password", "") == DEFAULT_AP_PASSWORD;
+    prefs.end();
+  }
+  if (!saved) {
+    Serial.println("Wi-Fi password reset failed: storage error");
+    reset_button_state = reset_button::State(reset_button::Phase::Idle);
+    return;
+  }
+  Serial.println("Wi-Fi password reset; restarting");
+  if (active_log) close_log_file();
+  ESP.restart();
 }
 
 void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
@@ -1819,6 +1865,7 @@ void handle_root() {
     <form id="wifi_form" class="card">
       <h3>Wi-Fi password</h3>
       <p class="muted">Enter 8–63 printable ASCII characters. The new password takes effect after restarting Backpack.</p>
+      <p class="muted">To reset the Wi-Fi password to 12345678, hold BOOT for more than 15 seconds while running, then release it. Backpack restarts.</p>
       <input id="wifi_password" type="password" autocomplete="new-password" maxlength="63" placeholder="New password" aria-label="New Wi-Fi password">
       <input id="wifi_confirm" type="password" autocomplete="new-password" maxlength="63" placeholder="Confirm password" aria-label="Confirm Wi-Fi password" style="margin-top:12px">
       <div class="row"><button id="wifi_save" type="submit">Save password</button></div>
@@ -2628,6 +2675,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  reset_button_raw = reset_button_stable = digitalRead(RESET_BUTTON_PIN) == LOW;
+  reset_button_changed_ms = millis();
   analogReadResolution(12);
   pinMode(BOARD_BATTERY_ADC_PIN, INPUT);
 
@@ -2668,6 +2718,7 @@ void loop() {
   update_logging_state();
   check_alarms();
   audio_poll();
+  update_reset_button();
   update_status_led();
 
   dns_server.processNextRequest();

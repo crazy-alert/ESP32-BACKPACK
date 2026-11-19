@@ -64,6 +64,17 @@ the previous password remains active until then. A previously saved password
 is preserved when updating the firmware. The panel warns while the default
 password is active.
 
+To reset only the Wi-Fi password to `12345678`, with the ESP32 already running,
+hold the DevKit's **BOOT** button for more than 15 seconds. The status LED
+flashes rapidly once the reset is ready. Release BOOT; the firmware saves the
+default password and restarts. Bind profiles, logs, and other settings are not
+reset. Release BOOT before powering on: holding GPIO0 at startup can enter the
+ESP32 serial bootloader instead of running the firmware. A button held during
+startup is ignored until released.
+
+The reset button state-policy checks can be compiled with
+`xtensa-esp32-elf-g++ -std=gnu++11 -fsyntax-only test/reset_button_test.cpp`.
+
 Flight-mode based logging recognises Betaflight mode strings and their disarmed
 suffixes. Unknown or stale mode data is displayed as unknown and stops logging;
 verify the mode format and logging on the bench for your flight controller.
