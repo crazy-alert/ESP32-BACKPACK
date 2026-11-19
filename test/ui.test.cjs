@@ -1,0 +1,81 @@
+const fs = require('fs');
+const {chromium} = require('playwright');
+const s=fs.readFileSync(__dirname+'/../src/main.cpp','utf8');
+const html=s.split('R"HTML(')[1].split(')HTML"')[0].replace(/<script src="https:[^>]+><\/script>/,'');
+const qr=fs.readFileSync(__dirname+'/../src/qr_code.h','utf8').split('R"QRJS(')[1].split(')QRJS"')[0];
+(async()=>{
+ const browser=await chromium.launch({headless:true,...(process.env.CHROME_PATH ? {executablePath:process.env.CHROME_PATH} : {})});
+ for (const width of [360, 800]) {
+  const page=await browser.newPage({viewport:{width,height:800}});
+  page.setDefaultTimeout(3000);
+  const errors=[];let passwordRequests=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.route('**/*',route=>{
+    const url=route.request().url(); let data={};
+    if(url.endsWith('/api/wifi_password')) { passwordRequests.push(route.request()); return route.fulfill({status:200,body:'Password saved. Restart Backpack to apply.'}); }
+    if(url.endsWith('/qrcode.js')) return route.fulfill({status:200,contentType:'application/javascript',body:qr});
+    if(url.includes('/api/sounds')||url.includes('/api/logs')) data={files:[]};
+    if(url.includes('/api/config')) data={bind:{},profiles:[],logging:{keep_files:10},buzzer:{},wifi:{default_password:true}};
+    if(url.includes('/api/telemetry')) data={frames_total:4,last_drone_telem_ms:10,drone_telem:{active:true},gps:{fresh:false},battery:{fresh:true},link:{fresh:true},attitude:{fresh:true},board_battery:{},espnow:{},sd:{status:'ok'},unknown_types:[],is_armed:null};
+    route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+  });
+  await page.goto('http://backpack.test/');
+  await page.evaluate(()=>{const old=window.setInterval;window.testIntervals=[];window.setInterval=(...args)=>{const id=old(...args);window.testIntervals.push(id);return id}});
+  await page.setContent(html); await page.waitForTimeout(300);
+  await page.evaluate(()=>window.testIntervals.forEach(clearInterval));
+  for(const tab of ['telemetry','bind','logging','buzzer','settings']){
+    await page.locator('[data-tab="'+tab+'"]').click();
+    if(!(await page.locator('#'+tab).evaluate(e=>e.classList.contains('active'))))throw Error('Tab failed: '+tab);
+    const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth);
+    if(overflow)throw Error('Overflow at '+width+' '+tab);
+  }
+  if(!(await page.locator('#default_password_warning').isVisible()))throw Error('default password warning missing');
+  await page.locator('#wifi_password').fill('short');
+  await page.locator('#wifi_confirm').fill('short');
+  await page.locator('#wifi_save').click();
+  if(passwordRequests.length)throw Error('short password was submitted');
+  await page.locator('#wifi_password').fill('newsecurepass');
+  await page.locator('#wifi_confirm').fill('differentpass');
+  await page.locator('#wifi_save').click();
+  if(passwordRequests.length)throw Error('mismatched password was submitted');
+  await page.locator('#wifi_confirm').fill('newsecurepass');
+  await page.locator('#wifi_save').click();
+  await page.waitForFunction(()=>document.getElementById('wifi_msg').textContent.includes('Restart'));
+  if(passwordRequests.length!==1)throw Error('valid password not submitted');
+  if(passwordRequests[0].headers()['x-backpack-request']!=='1')throw Error('CSRF header missing');
+  if(!(await page.locator('#wifi_msg').innerText()).includes('Restart'))throw Error('restart notice missing');
+  const idle={frames_total:0,tx_stream:{received:false,active:false,age_ms:0},last_drone_telem_ms:0,drone_telem:{active:false,age_ms:0},gps:{seen:false,fresh:false},battery:{seen:false,fresh:false},link:{seen:false,fresh:false},attitude:{seen:false,fresh:false},board_battery:{valid:false},espnow:{},sd:{available:false,status:'not available',logging_state:'no_sd'},unknown_types:[],is_armed:null,alarm:{active:false,active_names:[]}};
+  await page.evaluate(t=>drawTelemetry(t),idle);
+  if(!(await page.locator('#tx_stream_status').textContent()).includes('Waiting'))throw Error('TX waiting status missing');
+  if(!(await page.locator('#drone_status').textContent()).includes('No data'))throw Error('model waiting status missing');
+  if(!(await page.locator('#gps').textContent()).includes('No data'))throw Error('unreceived GPS shown as zero');
+  if((await page.locator('#txt_drone').textContent())!=='—')throw Error('unreceived battery shown as zero');
+  if(!(await page.locator('#sd_status').textContent()).includes('No SD'))throw Error('SD status missing');
+  const zero=structuredClone(idle);zero.battery={seen:true,fresh:true,remaining_pct:0,voltage:3,current:0};zero.sd={available:true,status:'logging',logging_state:'recording'};
+  await page.evaluate(t=>drawTelemetry(t),zero);
+  if((await page.locator('#txt_drone').textContent())!=='0%')throw Error('valid zero percent was hidden');
+  if((await page.locator('#recording_status').textContent())!=='Recording')throw Error('active recording not shown');
+  const stale=structuredClone(idle);stale.frames_total=4;stale.tx_stream={received:true,active:false,age_ms:12000};stale.gps={seen:true,fresh:false,age_ms:12000,fix:true,sats:6,lat:43,lon:131,speed_kmh:0};
+  await page.evaluate(t=>drawTelemetry(t),stale);
+  if(!(await page.locator('#tx_stream_status').textContent()).includes('12'))throw Error('TX age missing');
+  if(!(await page.locator('#gps').textContent()).includes('12'))throw Error('GPS stale age missing');
+  const active=structuredClone(idle);active.alarm={active:true,active_names:['lq_low','telemetry_lost'],event_id:1};
+  await page.evaluate(t=>drawTelemetry(t),active);
+  if(!(await page.locator('#active_alarms').textContent()).includes('lq_low') || !(await page.locator('#active_alarms').textContent()).includes('telemetry_lost'))throw Error('active alarm list incomplete');
+  await page.evaluate(()=>{gpsPoints=[{lat:43.1,lon:131.9,timestamp:'test',log:'x'}];gpsIdx=0;renderGpsPoint()});
+  if(await page.locator('#qr canvas').count()!==1)throw Error('offline QR was not rendered');
+  await page.evaluate(()=>drawTelemetry({frames_total:4,tx_stream:{received:true,active:true,age_ms:0},last_drone_telem_ms:10,drone_telem:{active:true},gps:{seen:true,fresh:false,age_ms:12000},battery:{seen:true,fresh:true},link:{seen:true,fresh:true},attitude:{seen:true,fresh:true},board_battery:{},espnow:{},sd:{status:'ok'},unknown_types:[],is_armed:null}));
+  if(!(await page.locator('#gps').evaluate(e=>e.classList.contains('telemetry-stale'))))throw Error('old GPS data is not marked stale');
+  if(await page.locator('#link').evaluate(e=>e.classList.contains('telemetry-stale')))throw Error('fresh link marked stale');
+  if(!(await page.locator('#att').innerText()).includes('unknown'))throw Error('unknown ARM state is not shown');
+  await page.evaluate(()=>drawTelemetry({frames_total:4,tx_stream:{received:true,active:true,age_ms:0},last_drone_telem_ms:10,drone_telem:{active:true},gps:{seen:false},battery:{seen:false},link:{seen:false},attitude:{seen:true,fresh:false,age_ms:12000},mode_seen:true,mode_fresh:true,flight_mode:'ACRO*',board_battery:{},espnow:{},sd:{status:'ok'},unknown_types:[],is_armed:false}));
+  if(!(await page.locator('#att .att-only').evaluate(e=>e.classList.contains('telemetry-stale'))))throw Error('old attitude not marked stale');
+  if(await page.locator('#att').evaluate(e=>e.classList.contains('telemetry-stale')))throw Error('fresh flight mode marked stale with attitude');
+  await page.evaluate(()=>{window.fetch=async()=>{throw Error('offline')};return refreshTelemetry()});
+  if(!/offline|disconnect|lost/i.test(await page.locator('#state').innerText())) throw Error('connection loss is not shown');
+  await page.locator('[data-tab="telemetry"]').click();
+  if(errors.length)throw Error(errors.join('; '));
+  console.log(width+': tabs, password validation, loss and freshness checks passed');
+  await page.close();
+ }
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

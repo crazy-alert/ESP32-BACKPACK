@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "qr_code.h"
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -13,7 +14,8 @@
 
 namespace {
 constexpr char AP_SSID[] = "ELRS-Backpack";
-constexpr char AP_PASSWORD[] = "12345678";
+constexpr char DEFAULT_AP_PASSWORD[] = "12345678";
+String ap_password;
 constexpr uint8_t WIFI_CHANNEL = 1;
 constexpr uint8_t CRSF_MAX_FRAME_LEN = 64;
 constexpr uint8_t ESPNOW_MAX_PAYLOAD = 250;
@@ -50,6 +52,8 @@ constexpr int STATUS_LED_PIN = 2;
 #endif
 
 struct TelemetryData {
+  uint32_t gps_ms = 0, battery_ms = 0, link_ms = 0, attitude_ms = 0, mode_ms = 0;
+  bool board_battery_valid = false;
   bool gps_fix = false;
   int gps_sats = 0;
   double gps_lat = 0.0;
@@ -80,6 +84,7 @@ struct TelemetryData {
   float vario_ms = 0.0f;
   String flight_mode = "N/A";
   bool is_armed = false;
+  bool arm_known = false;
 
   float board_voltage = 0.0f;
   int board_percent = 0;
@@ -667,10 +672,27 @@ void serial_log_frame(uint8_t type, const uint8_t *payload, uint8_t payload_len)
   Serial.printf("       data=%s\n", bytes_to_hex(payload, payload_len).c_str());
 }
 
+bool fresh(uint32_t last, uint32_t max_age = DRONE_TELEMETRY_STALE_MS) {
+  return last != 0 && static_cast<uint32_t>(millis() - last) <= max_age;
+}
+
 void update_armed_state() {
   String m = telemetry.flight_mode;
   m.toUpperCase();
-  telemetry.is_armed = (m.indexOf("ARM") >= 0 && m.indexOf("DISARM") < 0);
+  telemetry.arm_known = false;
+  // Betaflight suffixes encode disarmed; !FS! is ambiguous.
+  if (m == "!FS!" || m.isEmpty()) return;
+  const char suffix = m[m.length()-1];
+  String base = m;
+  if (suffix == '*' || suffix == '!' || suffix == '?') base.remove(base.length()-1);
+  const char *modes[] = {"ACRO", "AIR", "ANGL", "HOR", "RTH", "PASS", "POSH", "ALTH", "CHIR", "PHFL", "STAB"};
+  for (const char *known : modes) {
+    if (base == known) {
+      telemetry.arm_known = true;
+      telemetry.is_armed = suffix != '*' && suffix != '!' && suffix != '?';
+      return;
+    }
+  }
 }
 
 void ensure_sd_card() {
@@ -754,7 +776,7 @@ String build_new_log_name() {
 }
 
 void open_log_if_needed() {
-  if (!config.log.enabled || !telemetry.is_armed || !sd_available || active_log) {
+  if (!config.log.enabled || !telemetry.arm_known || !fresh(telemetry.mode_ms, 10000) || !telemetry.is_armed || !sd_available || active_log) {
     return;
   }
 
@@ -825,7 +847,7 @@ void log_frame_csv(uint8_t type, const uint8_t *payload, uint8_t payload_len) {
 }
 
 void update_logging_state() {
-  if (!telemetry.is_armed || !config.log.enabled || !sd_available) {
+  if (!telemetry.arm_known || !fresh(telemetry.mode_ms, 10000) || !telemetry.is_armed || !config.log.enabled || !sd_available) {
     if (active_log) {
       close_log_file();
       sd_status = sd_available ? "available" : "not available";
@@ -848,21 +870,21 @@ void trigger_alarm(const String &name, const String &sound_file) {
 }
 
 void check_alarms() {
-  const bool uplink_bad = config.buzzer.alarm_uplink_rssi_enabled &&
+  const bool uplink_bad = fresh(telemetry.link_ms, 10000) && config.buzzer.alarm_uplink_rssi_enabled &&
                           telemetry.link_rssi_1_dbm < config.buzzer.alarm_uplink_rssi_min_dbm;
-  const bool downlink_bad = config.buzzer.alarm_downlink_rssi_enabled &&
+  const bool downlink_bad = fresh(telemetry.link_ms, 10000) && config.buzzer.alarm_downlink_rssi_enabled &&
                             telemetry.link_down_rssi_dbm < config.buzzer.alarm_downlink_rssi_min_dbm;
-  const bool lq_bad = config.buzzer.alarm_lq_enabled &&
+  const bool lq_bad = fresh(telemetry.link_ms, 10000) && config.buzzer.alarm_lq_enabled &&
                       telemetry.link_quality < config.buzzer.alarm_lq_min;
   const bool telem_bad = config.buzzer.alarm_telem_loss_enabled &&
                          telemetry.last_drone_telem_ms > 0 &&
                          (millis() - telemetry.last_drone_telem_ms) >
                              static_cast<unsigned long>(config.buzzer.alarm_telem_loss_sec) * 1000UL;
   const bool board_batt_bad = config.buzzer.alarm_board_batt_enabled &&
-                              telemetry.board_percent > 0 &&
+                              telemetry.board_battery_valid &&
                               telemetry.board_percent < config.buzzer.alarm_board_batt_min_pct;
   const bool drone_batt_bad = config.buzzer.alarm_drone_batt_enabled &&
-                              telemetry.battery_remaining_pct > 0 &&
+                              fresh(telemetry.battery_ms, 10000) &&
                               telemetry.battery_remaining_pct < config.buzzer.alarm_drone_batt_min_pct;
 
   if (uplink_bad && !last_alarm_uplink) {
@@ -954,6 +976,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.gps_altitude_m = static_cast<int>(altitude) - 1000;
       telemetry.gps_sats = sats;
       telemetry.gps_fix = (sats > 0);
+      telemetry.gps_ms = now_ms;
       telemetry.last_drone_telem_ms = now_ms;
       break;
     }
@@ -968,6 +991,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.battery_current = static_cast<float>(c) / 10.0f;
       telemetry.battery_capacity_mah = mah;
       telemetry.battery_remaining_pct = rem;
+      telemetry.battery_ms = now_ms;
       telemetry.last_drone_telem_ms = now_ms;
       break;
     }
@@ -983,6 +1007,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.link_down_rssi_dbm = static_cast<int8_t>(payload[7]);
       telemetry.link_down_quality = payload[8];
       telemetry.link_down_snr_db = static_cast<int8_t>(payload[9]);
+      telemetry.link_ms = now_ms;
       break;
     }
     case 0x1E: {
@@ -994,6 +1019,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       telemetry.attitude_pitch_deg = (static_cast<float>(pitch) / 10000.0f) * kRadToDeg;
       telemetry.attitude_roll_deg = (static_cast<float>(roll) / 10000.0f) * kRadToDeg;
       telemetry.attitude_yaw_deg = (static_cast<float>(yaw) / 10000.0f) * kRadToDeg;
+      telemetry.attitude_ms = now_ms;
       telemetry.last_drone_telem_ms = now_ms;
       break;
     }
@@ -1003,6 +1029,7 @@ void parse_crsf_frame(const uint8_t *frame, uint8_t len) {
       const size_t copy_len = min(static_cast<size_t>(payload_len), sizeof(buf) - 1);
       memcpy(buf, payload, copy_len);
       telemetry.flight_mode = String(buf);
+      telemetry.mode_ms = now_ms;
       update_armed_state();
       telemetry.last_drone_telem_ms = now_ms;
       break;
@@ -1143,6 +1170,8 @@ void update_board_battery() {
   const int mv = analogReadMilliVolts(BOARD_BATTERY_ADC_PIN);
   const float v = (static_cast<float>(mv) / 1000.0f) * BOARD_BATTERY_DIVIDER_RATIO;
   telemetry.board_voltage = v;
+  // Below 2 V is not a valid reading for the configured 1S supply.
+  telemetry.board_battery_valid = v >= 2.0f && v <= 5.5f;
 
   float pct = (v - BOARD_BATTERY_MIN_V) / (BOARD_BATTERY_MAX_V - BOARD_BATTERY_MIN_V) * 100.0f;
   if (pct < 0.0f) pct = 0.0f;
@@ -1176,6 +1205,10 @@ String telemetry_json() {
   out += "{";
   out += "\"uptime_ms\":" + String(millis()) + ",";
   out += "\"last_frame_ms\":" + String(telemetry.last_frame_ms) + ",";
+  out += "\"tx_stream\":{";
+  out += "\"received\":" + String(telemetry.frames_total > 0 ? "true" : "false") + ",";
+  out += "\"active\":" + String(telemetry.frames_total > 0 && (uint32_t)(millis() - telemetry.last_frame_ms) <= 3000 ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(telemetry.frames_total > 0 ? (uint32_t)(millis() - telemetry.last_frame_ms) : 0) + "},";
   out += "\"last_drone_telem_ms\":" + String(telemetry.last_drone_telem_ms) + ",";
   const uint32_t drone_age_ms = telemetry.last_drone_telem_ms == 0
                                     ? 0
@@ -1210,15 +1243,23 @@ String telemetry_json() {
   out += "\"sd\":{";
   out += "\"available\":" + String(sd_available ? "true" : "false") + ",";
   out += "\"status\":\"" + json_escape(sd_status) + "\",";
-  out += "\"active_log\":\"" + json_escape(active_log_name) + "\"";
+  out += "\"active_log\":\"" + json_escape(active_log_name) + "\",";
+  const char *logging_state = !sd_available ? "no_sd" : !config.log.enabled ? "disabled" :
+    active_log ? "recording" : !telemetry.arm_known || !fresh(telemetry.mode_ms, 10000) ? "arm_unknown" :
+    !telemetry.is_armed ? "waiting_arm" : "not_recording";
+  out += "\"logging_state\":\"" + String(logging_state) + "\"";
   out += "},";
 
   out += "\"board_battery\":{";
+  out += "\"valid\":" + String(telemetry.board_battery_valid ? "true" : "false") + ",";
   out += "\"voltage\":" + String(telemetry.board_voltage, 2) + ",";
   out += "\"percent\":" + String(telemetry.board_percent);
   out += "},";
 
   out += "\"gps\":{";
+  out += "\"seen\":" + String(telemetry.gps_ms ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(telemetry.gps_ms ? (uint32_t)(millis() - telemetry.gps_ms) : 0) + ",";
+  out += "\"fresh\":" + String(fresh(telemetry.gps_ms, 10000) ? "true" : "false") + ",";
   out += "\"fix\":" + String(telemetry.gps_fix ? "true" : "false") + ",";
   out += "\"sats\":" + String(telemetry.gps_sats) + ",";
   out += "\"lat\":" + String(telemetry.gps_lat, 7) + ",";
@@ -1229,6 +1270,9 @@ String telemetry_json() {
   out += "},";
 
   out += "\"battery\":{";
+  out += "\"seen\":" + String(telemetry.battery_ms ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(telemetry.battery_ms ? (uint32_t)(millis() - telemetry.battery_ms) : 0) + ",";
+  out += "\"fresh\":" + String(fresh(telemetry.battery_ms, 10000) ? "true" : "false") + ",";
   out += "\"voltage\":" + String(telemetry.battery_voltage, 2) + ",";
   out += "\"current\":" + String(telemetry.battery_current, 2) + ",";
   out += "\"capacity_mah\":" + String(telemetry.battery_capacity_mah) + ",";
@@ -1236,6 +1280,9 @@ String telemetry_json() {
   out += "},";
 
   out += "\"link\":{";
+  out += "\"seen\":" + String(telemetry.link_ms ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(telemetry.link_ms ? (uint32_t)(millis() - telemetry.link_ms) : 0) + ",";
+  out += "\"fresh\":" + String(fresh(telemetry.link_ms, 10000) ? "true" : "false") + ",";
   out += "\"rssi1_dbm\":" + String(telemetry.link_rssi_1_dbm) + ",";
   out += "\"rssi2_dbm\":" + String(telemetry.link_rssi_2_dbm) + ",";
   out += "\"lq\":" + String(telemetry.link_quality) + ",";
@@ -1249,19 +1296,40 @@ String telemetry_json() {
   out += "},";
 
   out += "\"attitude\":{";
+  out += "\"seen\":" + String(telemetry.attitude_ms ? "true" : "false") + ",";
+  out += "\"age_ms\":" + String(telemetry.attitude_ms ? (uint32_t)(millis() - telemetry.attitude_ms) : 0) + ",";
+  out += "\"fresh\":" + String(fresh(telemetry.attitude_ms, 10000) ? "true" : "false") + ",";
   out += "\"pitch_deg\":" + String(telemetry.attitude_pitch_deg, 2) + ",";
   out += "\"roll_deg\":" + String(telemetry.attitude_roll_deg, 2) + ",";
   out += "\"yaw_deg\":" + String(telemetry.attitude_yaw_deg, 2) + ",";
   out += "\"vario_ms\":" + String(telemetry.vario_ms, 2);
   out += "},";
 
+  out += "\"mode_seen\":" + String(telemetry.mode_ms ? "true" : "false") + ",";
+  out += "\"mode_fresh\":" + String(fresh(telemetry.mode_ms, 10000) ? "true" : "false") + ",";
+  out += "\"mode_age_ms\":" + String(telemetry.mode_ms ? (uint32_t)(millis() - telemetry.mode_ms) : 0) + ",";
   out += "\"flight_mode\":\"" + json_escape(telemetry.flight_mode) + "\",";
-  out += "\"is_armed\":" + String(telemetry.is_armed ? "true" : "false") + ",";
+  out += "\"is_armed\":" + String(telemetry.arm_known && fresh(telemetry.mode_ms, 10000) ? (telemetry.is_armed ? "true" : "false") : "null") + ",";
 
   const bool alarm_active = last_alarm_uplink || last_alarm_downlink || last_alarm_lq || last_alarm_telem ||
                             last_alarm_board_batt || last_alarm_drone_batt;
   out += "\"alarm\":{";
   out += "\"active\":" + String(alarm_active ? "true" : "false") + ",";
+  out += "\"active_names\":[";
+  bool alarm_first = true;
+  auto append_alarm = [&](bool active, const char *name) {
+    if (!active) return;
+    if (!alarm_first) out += ",";
+    alarm_first = false;
+    out += "\"" + String(name) + "\"";
+  };
+  append_alarm(last_alarm_uplink, "uplink_rssi_low");
+  append_alarm(last_alarm_downlink, "downlink_rssi_low");
+  append_alarm(last_alarm_lq, "lq_low");
+  append_alarm(last_alarm_telem, "telemetry_lost");
+  append_alarm(last_alarm_board_batt, "board_battery_low");
+  append_alarm(last_alarm_drone_batt, "drone_battery_low");
+  out += "],";
   out += "\"event_id\":" + String(alarm_event_id) + ",";
   out += "\"name\":\"" + json_escape(last_alarm_name) + "\",";
   out += "\"sound\":\"" + json_escape(last_alarm_sound) + "\",";
@@ -1305,6 +1373,8 @@ String config_json() {
   String out;
   out.reserve(4096);
   out += "{";
+
+  out += "\"wifi\":{\"default_password\":" + String(ap_password == DEFAULT_AP_PASSWORD ? "true" : "false") + "},";
 
   out += "\"bind\":{";
   out += "\"bind_phrase\":\"" + json_escape(config.bind_phrase) + "\",";
@@ -1557,44 +1627,50 @@ void service_pending_espnow_restart() {
 void handle_root() {
   static const char HTML[] PROGMEM = R"HTML(
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ELRS Backpack Panel</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="/qrcode.js"></script>
   <style>
-    :root{--bg:#0b1220;--panel:#111827;--line:#334155;--txt:#e5e7eb;--muted:#94a3b8;--ok:#34d399}
-    *{box-sizing:border-box} body{margin:0;padding:16px;color:var(--txt);font-family:Segoe UI,sans-serif;background:radial-gradient(circle at top,#1e293b,var(--bg))}
-    h1{margin:0 0 8px} .tabs{display:flex;gap:8px;margin:10px 0 14px;flex-wrap:wrap}.tab{padding:8px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer}
-    .tab.active{background:#1f2937} .pane{display:none}.pane.active{display:block}
-    .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0}
-    .row{display:flex;justify-content:space-between;margin:6px 0;gap:8px;align-items:center}.k{color:var(--muted)} .v{font-weight:700}
-    input,select{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);background:#0f172a;color:var(--txt)}
-    button{padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#1f2937;color:var(--txt);cursor:pointer}
-    .ok{color:var(--ok)} .muted{color:var(--muted);font-size:12px}
-    .warn{color:#f59e0b}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
-    code{white-space:pre-wrap}
-    .bar-wrap{margin:6px 0 10px}
-    .bar-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-    .emoji{font-size:20px;width:22px;text-align:center}
-    .bar{flex:1;height:14px;border-radius:8px;background:#1f2937;border:1px solid #2a3648;overflow:hidden}
-    .fill{height:100%;width:0%;transition:width .2s;background:#22c55e}
-    .fill.yellow{background:#facc15}
-    .fill.red{background:#ef4444}
-    .telemetry-stale{opacity:.65}
-    .telemetry-stale h3,.telemetry-stale .k,.telemetry-stale .v{text-decoration:line-through}
-    .telemetry-stale .v{font-weight:600}
-    #drone_bar_row.telemetry-stale .bar{opacity:.45}
-    #drone_bar_row.telemetry-stale #txt_drone{text-decoration:line-through}
-    body.alarm-flash{background:#7f1d1d !important;transition:background .15s}
-    #alarm_overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none}
-    #alarm_box{background:#111827;border:1px solid #ef4444;color:#fecaca;padding:16px 22px;border-radius:12px;font-weight:700;font-size:20px}
+    :root{font-family:system-ui,-apple-system,sans-serif;color:#e6ebf2;background:#0d1219;color-scheme:dark}
+    *{box-sizing:border-box}html,body{width:100%;max-width:100%;overflow-x:hidden}
+    body{margin:0;min-height:100vh;background:radial-gradient(ellipse at top,#1a2937,#0d1219 65%)}
+    main{width:100%;max-width:720px;min-width:0;margin:auto;padding:30px 20px 60px}
+    header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:28px}
+    .brand{font-size:12px;font-weight:750;letter-spacing:.18em;color:#9dabbc}
+    .badge{font-size:12px;color:#8ce1bf;background:#16342c;padding:7px 10px;border-radius:99px;white-space:nowrap}
+    h1{font-size:30px;letter-spacing:-.035em;margin:0 0 8px} .intro{color:#a5b2c2;line-height:1.55;margin:0 0 20px}
+    .tabs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;background:#111a24;border:1px solid #2a3949;border-radius:13px;padding:4px;margin:0 0 18px}
+    .tab{min-width:0;padding:11px 3px;background:transparent;border:0;border-radius:9px;color:#aab9ca;font-size:12px;font-weight:700;cursor:pointer}
+    .tab.active{background:#2a3b49;color:#f1f8fa}.pane{display:none}.pane.active{display:block}
+    .card,.bar-wrap{min-width:0;background:#151e29;border:1px solid #2a3949;border-radius:18px;padding:20px;margin:14px 0}
+    .card h3{font-size:17px;letter-spacing:-.01em;margin:0 0 14px}.card h4{font-size:14px;color:#e6ebf2;margin:22px 0 10px;padding-top:16px;border-top:1px solid #2a3949}
+    .row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0;min-width:0}.row>span{min-width:0;overflow-wrap:anywhere}.k,.muted{color:#9dabbc}.muted{font-size:12px;line-height:1.5;overflow-wrap:anywhere}.v{font-weight:700;text-align:right;overflow-wrap:anywhere}
+    input:not([type=checkbox]),select{width:100%;min-width:0;background:#0d151e;color:#f0f5fb;border:1px solid #3c4c5e;border-radius:10px;padding:12px;font:inherit;outline:none}
+    .row input[type=number],.row select{width:min(55%,220px)}input:focus,select:focus{border-color:#64d2ae;box-shadow:0 0 0 3px #64d2ae22}
+    input[type=checkbox]{accent-color:#64d2ae;width:19px!important;height:19px;flex:none}
+    button{border:0;border-radius:11px;padding:12px 15px;background:#293a47;color:#e6f1f1;font:inherit;font-size:13px;font-weight:700;cursor:pointer}
+    button:hover{filter:brightness(1.12)}button:focus-visible,.tab:focus-visible{outline:2px solid #75deb9;outline-offset:2px}
+    #save_bind,#save_log_cfg,#save_bz_cfg,#upload_sound_btn,#wifi_save{width:100%;background:#75deb9;color:#0b2119}
+    .status-card .row{align-items:flex-start}.status-card .v{font-size:13px}.sensor-age{font-size:12px;color:#a5b2c2;margin:-6px 0 12px}.alert-list{border-color:#b84c45;color:#fecaca}.alert-list[hidden]{display:none}.ok{color:#8ce1bf}.warn{color:#ffca83}#state{padding:0 2px;font-size:13px;font-weight:650}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.grid .card{margin:0}
+    code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;color:#a5b2c2;font-size:12px}hr{border:0;border-top:1px solid #2a3949;margin:16px 0}
+    .bar-wrap{margin-top:0}.bar-row{display:flex;align-items:center;gap:10px;margin:8px 0}.emoji{font-size:18px;width:24px;text-align:center}
+    .bar{flex:1;min-width:0;height:10px;border-radius:99px;background:#293a47;overflow:hidden}.fill{height:100%;width:0%;transition:width .2s;background:#75deb9}.fill.yellow{background:#facc15}.fill.red{background:#ef4444}
+    .telemetry-stale{opacity:.65}.telemetry-stale h3,.telemetry-stale .k,.telemetry-stale .v{text-decoration:line-through}.telemetry-stale .v{font-weight:600}#drone_bar_row.telemetry-stale .bar{opacity:.45}#drone_bar_row.telemetry-stale #txt_drone{text-decoration:line-through}
+    body.alarm-flash{background:#7f1d1d!important;transition:background .15s}#alarm_overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;pointer-events:none;z-index:10}#alarm_box{background:#151e29;border:1px solid #ef4444;color:#fecaca;padding:16px 22px;border-radius:12px;font-weight:700;font-size:20px}
+    #qr{margin-top:14px}#qr img,#qr canvas{max-width:100%}a{color:#75deb9}input[type=file]{font-size:12px}
+    @media(max-width:520px){main{padding:24px 16px 48px}.grid{grid-template-columns:minmax(0,1fr)}.tabs{grid-template-columns:repeat(2,minmax(0,1fr))}.card,.bar-wrap{padding:18px}.row{gap:8px}}
   </style>
 </head>
 <body>
-  <h1>ELRS Backpack Panel</h1>
+<main>
+  <header><span class="brand">BACKPACK / CONTROL</span><span class="badge">ESP-NOW</span></header>
+  <h1>Backpack</h1>
+  <p class="intro">Telemetry, logs and alerts.</p>
+  <div id="default_password_warning" class="card warn" hidden>Default Wi-Fi password is in use. Change it in Settings.</div>
 
   <div id="alarm_overlay"><div id="alarm_box">ALARM</div></div>
 
@@ -1611,15 +1687,23 @@ void handle_root() {
     </div>
   </div>
 
-  <div class="tabs">
-    <div class="tab active" data-tab="telemetry">Telemetry</div>
-    <div class="tab" data-tab="bind">Bind</div>
-    <div class="tab" data-tab="logging">Logging</div>
-    <div class="tab" data-tab="buzzer">Buzzer</div>
-  </div>
+  <nav class="tabs" aria-label="Sections">
+    <button type="button" class="tab active" data-tab="telemetry">Telemetry</button>
+    <button type="button" class="tab" data-tab="bind">Bind</button>
+    <button type="button" class="tab" data-tab="logging">Logging</button>
+    <button type="button" class="tab" data-tab="buzzer">Buzzer</button>
+    <button type="button" class="tab" data-tab="settings">Settings</button>
+  </nav>
 
   <div id="telemetry" class="pane active">
-    <div id="state" class="ok">Waiting telemetry...</div>
+    <div class="card status-card">
+      <h3>Connection</h3>
+      <div class="row"><span class="k">Backpack frames</span><span id="tx_stream_status" class="v">Waiting</span></div>
+      <div class="row"><span class="k">Model telemetry</span><span id="drone_status" class="v">No data</span></div>
+      <div class="row"><span class="k">Logging</span><span id="recording_status" class="v">Checking</span></div>
+      <div id="state" class="muted">Waiting for data</div>
+    </div>
+    <div id="active_alarms" class="card alert-list" role="status" hidden></div>
     <div class="grid">
       <div class="card" id="gps"></div>
       <div class="card" id="bat"></div>
@@ -1731,6 +1815,17 @@ void handle_root() {
     </div>
   </div>
 
+  <div id="settings" class="pane">
+    <form id="wifi_form" class="card">
+      <h3>Wi-Fi password</h3>
+      <p class="muted">Enter 8–63 printable ASCII characters. The new password takes effect after restarting Backpack.</p>
+      <input id="wifi_password" type="password" autocomplete="new-password" maxlength="63" placeholder="New password" aria-label="New Wi-Fi password">
+      <input id="wifi_confirm" type="password" autocomplete="new-password" maxlength="63" placeholder="Confirm password" aria-label="Confirm Wi-Fi password" style="margin-top:12px">
+      <div class="row"><button id="wifi_save" type="submit">Save password</button></div>
+      <div id="wifi_msg" class="muted" role="status"></div>
+    </form>
+  </div>
+
 <script>
 const by = id => document.getElementById(id);
 const f = (n, d = 1) => Number.isFinite(n) ? Number(n).toFixed(d) : "-";
@@ -1798,7 +1893,8 @@ function drawQR(gps){
 }
 
 function setBar(id, txtId, pct){
-  const p = Math.max(0, Math.min(100, Number(pct||0)));
+  if (pct === null || pct === undefined) { by(id).style.width = '0%'; by(txtId).textContent = '—'; return; }
+  const p = Math.max(0, Math.min(100, Number(pct)));
   const el = by(id);
   el.style.width = `${p}%`;
   el.classList.remove('yellow','red');
@@ -1811,9 +1907,12 @@ function maybePlayAlarm(t){
   const now = Date.now();
   const alarm = t.alarm || {};
   const active = !!alarm.active;
-  document.body.classList.toggle('alarm-flash', active);
+  const list = by('active_alarms');
+  const names = Array.isArray(alarm.active_names) ? alarm.active_names : [];
+  list.hidden = !active || names.length === 0;
+  list.textContent = names.length ? 'Active alerts: ' + names.join(', ') : '';
 
-  if (alarm.event_id > lastAlarmId) {
+  if (active && alarm.event_id > lastAlarmId) {
     lastAlarmId = alarm.event_id;
     by('alarm_box').textContent = alarm.name || 'ALARM';
     alarmPopupUntilMs = now + 2500;
@@ -1827,16 +1926,21 @@ function maybePlayAlarm(t){
 }
 
 function setStaleView(isStale){
-  ['gps','link','att'].forEach(id => {
-    by(id).classList.toggle('telemetry-stale', isStale);
-  });
+  // Each sensor has its own freshness; see drawTelemetry.
   document.querySelectorAll('.drone-only').forEach(el => {
     el.classList.toggle('telemetry-stale', isStale);
   });
   by('drone_bar_row').classList.toggle('telemetry-stale', isStale);
 }
 
+function sensorTitle(title, data){
+  const age = data.seen && !data.fresh ? `<div class="sensor-age">Last update ${(Number(data.age_ms || 0)/1000).toFixed(1)} s ago</div>` : '';
+  return `<h3>${title}</h3>${age}`;
+}
 function drawTelemetry(t){
+  const tx = t.tx_stream || {};
+  by('tx_stream_status').textContent = !tx.received ? 'Waiting for frames' : tx.active ? 'Frames received' : `No recent frames (${(Number(tx.age_ms || 0)/1000).toFixed(1)} s)`;
+  by('drone_status').textContent = !t.last_drone_telem_ms ? 'No data yet' : t.drone_telem && t.drone_telem.active ? 'Data received' : `No recent data (${(Number(t.drone_telem?.age_ms || 0)/1000).toFixed(1)} s)`;
   const ageMs = Number((t.drone_telem && t.drone_telem.age_ms) || 0);
   const hasDroneTelem = Number(t.last_drone_telem_ms || 0) > 0;
   const isStale = hasDroneTelem && !(t.drone_telem && t.drone_telem.active);
@@ -1854,15 +1958,20 @@ function drawTelemetry(t){
     by('state').textContent = 'Drone telemetry active';
     by('state').className = 'ok';
   }
-  by('gps').innerHTML = `<h3>GPS</h3><div class="row"><span class="k">Fix</span><span class="v">${t.gps.fix}</span></div><div class="row"><span class="k">Sats</span><span class="v">${t.gps.sats}</span></div><div class="row"><span class="k">Lat</span><span class="v">${f(t.gps.lat,7)}</span></div><div class="row"><span class="k">Lon</span><span class="v">${f(t.gps.lon,7)}</span></div><div class="row"><span class="k">Speed</span><span class="v">${f(t.gps.speed_kmh)} km/h</span></div>`;
-  by('bat').innerHTML = `<h3>Battery</h3><div class="drone-only"><div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div></div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${f(t.board_battery.voltage,2)} V</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.percent} %</span></div>`;
-  by('link').innerHTML = `<h3>Link</h3><div class="row"><span class="k">RSSI1</span><span class="v">${t.link.rssi1_dbm} dBm</span></div><div class="row"><span class="k">RSSI2</span><span class="v">${t.link.rssi2_dbm} dBm</span></div><div class="row"><span class="k">LQ</span><span class="v">${t.link.lq}</span></div><div class="row"><span class="k">SNR</span><span class="v">${t.link.snr_db} dB</span></div><div class="row"><span class="k">Active Ant</span><span class="v">${t.link.active_antenna}</span></div><div class="row"><span class="k">Down RSSI</span><span class="v">${t.link.down_rssi_dbm} dBm</span></div><div class="row"><span class="k">Down LQ</span><span class="v">${t.link.down_lq}</span></div><div class="row"><span class="k">Down SNR</span><span class="v">${t.link.down_snr_db} dB</span></div>`;
-  by('att').innerHTML = `<h3>Attitude</h3><div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div><div class="row"><span class="k">Mode</span><span class="v">${h(t.flight_mode)}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed}</span></div>`;
+  by('gps').innerHTML = `${sensorTitle('GPS', t.gps)}${!t.gps.seen ? '<div class="muted">No data</div>' : `<div class="row"><span class="k">Fix</span><span class="v">${t.gps.fix}</span></div><div class="row"><span class="k">Sats</span><span class="v">${t.gps.sats}</span></div><div class="row"><span class="k">Lat</span><span class="v">${f(t.gps.lat,7)}</span></div><div class="row"><span class="k">Lon</span><span class="v">${f(t.gps.lon,7)}</span></div><div class="row"><span class="k">Speed</span><span class="v">${f(t.gps.speed_kmh)} km/h</span></div>`}`;
+  by('bat').innerHTML = `${sensorTitle('Battery', t.battery)}<div class="drone-only">${!t.battery.seen ? '<div class="muted">No data</div>' : `<div class="row"><span class="k">FC Voltage</span><span class="v">${f(t.battery.voltage,2)} V</span></div><div class="row"><span class="k">FC Current</span><span class="v">${f(t.battery.current,2)} A</span></div><div class="row"><span class="k">FC Remain</span><span class="v">${t.battery.remaining_pct} %</span></div>`}</div><hr><div class="row"><span class="k">Board Voltage</span><span class="v">${t.board_battery.valid ? f(t.board_battery.voltage,2)+' V' : 'No data'}</span></div><div class="row"><span class="k">Board Percent</span><span class="v">${t.board_battery.valid ? t.board_battery.percent+' %' : 'No data'}</span></div>`;
+  by('link').innerHTML = `${sensorTitle('Link', t.link)}${!t.link.seen ? '<div class="muted">No data</div>' : `<div class="row"><span class="k">RSSI1</span><span class="v">${t.link.rssi1_dbm} dBm</span></div><div class="row"><span class="k">RSSI2</span><span class="v">${t.link.rssi2_dbm} dBm</span></div><div class="row"><span class="k">LQ</span><span class="v">${t.link.lq}</span></div><div class="row"><span class="k">SNR</span><span class="v">${t.link.snr_db} dB</span></div><div class="row"><span class="k">Active Ant</span><span class="v">${t.link.active_antenna}</span></div><div class="row"><span class="k">Down RSSI</span><span class="v">${t.link.down_rssi_dbm} dBm</span></div><div class="row"><span class="k">Down LQ</span><span class="v">${t.link.down_lq}</span></div><div class="row"><span class="k">Down SNR</span><span class="v">${t.link.down_snr_db} dB</span></div>`}`;
+  by('att').innerHTML = `${sensorTitle('Attitude', t.attitude)}<div class="att-only">${!t.attitude.seen ? '<div class="muted">No attitude data</div>' : `<div class="row"><span class="k">Pitch</span><span class="v">${f(t.attitude.pitch_deg,2)}</span></div><div class="row"><span class="k">Roll</span><span class="v">${f(t.attitude.roll_deg,2)}</span></div><div class="row"><span class="k">Yaw</span><span class="v">${f(t.attitude.yaw_deg,2)}</span></div>`}</div><div class="row"><span class="k">Mode</span><span class="v">${!t.mode_seen ? 'No data' : h(t.flight_mode)+(t.mode_fresh ? '' : ` (${(Number(t.mode_age_ms || 0)/1000).toFixed(1)} s ago)`)}</span></div><div class="row"><span class="k">Armed</span><span class="v">${t.is_armed === null ? 'unknown' : t.is_armed}</span></div>`;
   by('sys').innerHTML = `<h3>System</h3><div class="row"><span class="k">Frames</span><span class="v">${t.frames_total}</span></div><div class="row"><span class="k">ESPNow</span><span class="v">${t.espnow.packets}</span></div><div class="row"><span class="k">Queue Drop</span><span class="v">${t.espnow.drop_queue}</span></div><div class="row"><span class="k">No CRSF</span><span class="v">${t.espnow.no_crsf}</span></div><div class="row"><span class="k">SD</span><span class="v">${t.sd.available}</span></div><div class="row"><span class="k">SD Status</span><span class="v">${h(t.sd.status)}</span></div><div class="row"><span class="k">Active log</span><span class="v">${h(t.sd.active_log)}</span></div>`;
-  by('sd_status').textContent = `SD: ${t.sd.status}`;
-  setBar('bar_board','txt_board', t.board_battery.percent);
-  setBar('bar_drone','txt_drone', t.battery.remaining_pct);
-  setStaleView(isStale);
+  const logStates={no_sd:'No SD card',disabled:'Logging disabled',recording:'Recording',arm_unknown:'Not recording: ARM state unknown',waiting_arm:'Waiting for ARM',not_recording:'Not recording: check SD'};
+  by('sd_status').textContent = logStates[t.sd.logging_state] || `SD: ${t.sd.status}`;
+  by('recording_status').textContent = by('sd_status').textContent;
+  setBar('bar_board','txt_board', t.board_battery.valid ? t.board_battery.percent : null);
+  setBar('bar_drone','txt_drone', t.battery.seen ? t.battery.remaining_pct : null);
+  setStaleView(!!t.battery.seen && !t.battery.fresh);
+  by('gps').classList.toggle('telemetry-stale', !!t.gps.seen && !t.gps.fresh);
+  by('link').classList.toggle('telemetry-stale', !!t.link.seen && !t.link.fresh);
+  by('att').querySelector('.att-only').classList.toggle('telemetry-stale', !!t.attitude.seen && !t.attitude.fresh);
   drawUnknown(t.unknown_types);
   maybePlayAlarm(t);
 }
@@ -1870,6 +1979,7 @@ function drawTelemetry(t){
 async function loadConfig(){
   const r = await fetch('/api/config', {cache:'no-store'});
   cfg = await r.json();
+  by('default_password_warning').hidden = !(cfg.wifi && cfg.wifi.default_password);
 
   by('bind_phrase').value = cfg.bind.bind_phrase || '';
   by('uid_text').value = cfg.bind.uid_text || '';
@@ -1938,29 +2048,66 @@ async function viewLog(name){
 window.viewLog = viewLog;
 
 async function refreshTelemetry(){
+  if (refreshTelemetry.busy) return;
+  refreshTelemetry.busy = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(()=>controller.abort(), 3000);
   try {
-    const r = await fetch('/api/telemetry', {cache:'no-store'});
-    if (!r.ok) return;
+    const r = await fetch('/api/telemetry', {cache:'no-store', signal:controller.signal});
+    if (!r.ok) throw Error('offline');
     drawTelemetry(await r.json());
-  } catch(_) {}
+  } catch(_) {
+    by('state').textContent = 'Backpack disconnected — displayed values are outdated';
+    by('state').className = 'warn';
+    setStaleView(true);
+    ['gps','link'].forEach(id=>by(id).classList.add('telemetry-stale'));
+    const attitude = by('att').querySelector('.att-only');
+    if (attitude) attitude.classList.add('telemetry-stale');
+    by('tx_stream_status').textContent = 'Backpack disconnected';
+    by('drone_status').textContent = 'Unknown';
+  } finally { clearTimeout(timeout); refreshTelemetry.busy = false; }
 }
+
+by('wifi_form').onsubmit = async (event) => {
+  event.preventDefault();
+  const password = by('wifi_password').value;
+  if (!/^[\x20-\x7e]{8,63}$/.test(password)) {
+    by('wifi_msg').textContent = 'Use 8–63 printable ASCII characters.';
+    return;
+  }
+  if (password !== by('wifi_confirm').value) {
+    by('wifi_msg').textContent = 'Passwords do not match.';
+    return;
+  }
+  by('wifi_save').disabled = true;
+  try {
+    const body = new URLSearchParams({password});
+    const r = await fetch('/api/wifi_password', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
+    const message = await r.text();
+    if (!r.ok) throw Error(message || 'Save failed.');
+    by('wifi_password').value = '';
+    by('wifi_confirm').value = '';
+    by('wifi_msg').textContent = message;
+  } catch (error) { by('wifi_msg').textContent = error.message || 'Save failed.'; }
+  finally { by('wifi_save').disabled = false; }
+};
 
 by('save_bind').onclick = async () => {
   const body = new URLSearchParams({bind_phrase: by('bind_phrase').value, uid_text: by('uid_text').value, note: by('bind_note').value});
-  const r = await fetch('/api/bind', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const r = await fetch('/api/bind', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
   by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
 window.applyProfile = async (idx) => {
   const body = new URLSearchParams({index: String(idx)});
-  const r = await fetch('/api/profile_apply', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const r = await fetch('/api/profile_apply', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
   by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
 window.deleteProfile = async (idx) => {
   if (!confirm(`Delete profile #${idx}?`)) return;
   const body = new URLSearchParams({index: String(idx)});
-  const r = await fetch('/api/profile_delete', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const r = await fetch('/api/profile_delete', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
   by('bind_msg').textContent = await r.text();
   await loadConfig();
 };
@@ -1975,7 +2122,7 @@ by('save_log_cfg').onclick = async () => {
     log_attitude: by('log_attitude').checked ? '1' : '0',
     log_unknown: by('log_unknown').checked ? '1' : '0'
   });
-  const r = await fetch('/api/log_cfg', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const r = await fetch('/api/log_cfg', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
   by('log_msg').textContent = await r.text();
   await loadConfig();
   await loadLogs();
@@ -2003,7 +2150,7 @@ by('save_bz_cfg').onclick = async () => {
     db_min: by('bz_db_min').value,
     db_snd: by('bz_db_snd').value
   });
-  const r = await fetch('/api/buzzer_cfg', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body});
+  const r = await fetch('/api/buzzer_cfg', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'}, body});
   by('bz_msg').textContent = await r.text();
   await loadConfig();
 };
@@ -2016,7 +2163,7 @@ by('upload_sound_btn').onclick = async () => {
   }
   const fd = new FormData();
   fd.append('file', fi.files[0], fi.files[0].name);
-  const r = await fetch('/api/upload_sound', {method:'POST', body: fd});
+  const r = await fetch('/api/upload_sound', {method:'POST', headers:{'X-Backpack-Request':'1'}, body: fd});
   by('upload_msg').textContent = await r.text();
   await loadSounds();
   await loadConfig();
@@ -2062,17 +2209,17 @@ by('btn_next_qr').onclick = () => {
   try {
     await fetch('/api/time_sync', {
       method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      headers:{'Content-Type':'application/x-www-form-urlencoded','X-Backpack-Request':'1'},
       body:new URLSearchParams({epoch: String(Math.floor(Date.now()/1000))})
     });
   } catch(_) {}
-  await loadSounds();
-  await loadConfig();
-  await loadLogs();
+  try { await loadSounds(); await loadConfig(); await loadLogs(); }
+  catch (_) { by('state').textContent = 'Backpack disconnected — retrying telemetry'; by('state').className = 'warn'; }
   await refreshTelemetry();
   setInterval(refreshTelemetry, 500);
 })();
 </script>
+</main>
 </body>
 </html>
   )HTML";
@@ -2081,16 +2228,40 @@ by('btn_next_qr').onclick = () => {
 }
 
 void handle_api_telemetry() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", telemetry_json());
 }
 
 void handle_api_config() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", config_json());
 }
 
+bool allow_write() {
+  if (server.header("X-Backpack-Request") == "1") return true;
+  server.send(403, "text/plain", "request denied");
+  return false;
+}
+
+void handle_api_wifi_password() {
+  if (!allow_write()) return;
+  if (!server.hasArg("password")) { server.send(400, "text/plain", "Password is required."); return; }
+  const String password = server.arg("password");
+  if (password.length() < 8 || password.length() > 63) {
+    server.send(400, "text/plain", "Use 8–63 printable ASCII characters."); return;
+  }
+  for (size_t i = 0; i < password.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(password[i]);
+    if (c < 0x20 || c > 0x7e) { server.send(400, "text/plain", "Use printable ASCII characters."); return; }
+  }
+  if (!prefs.begin("backpack-ap", false)) { server.send(500, "text/plain", "Could not open password storage."); return; }
+  const size_t written = prefs.putString("password", password);
+  const bool saved = written > 0 && prefs.getString("password", "") == password;
+  prefs.end();
+  if (!saved) { server.send(500, "text/plain", "Could not save password."); return; }
+  server.send(200, "text/plain", "Password saved. Restart Backpack to apply.");
+}
+
 void handle_api_time_sync() {
+  if (!allow_write()) return;
   if (!server.hasArg("epoch")) {
     server.send(400, "text/plain", "missing epoch");
     return;
@@ -2105,6 +2276,7 @@ void handle_api_time_sync() {
 }
 
 void handle_api_bind() {
+  if (!allow_write()) return;
   if (!server.hasArg("bind_phrase") || !server.hasArg("uid_text")) {
     server.send(400, "text/plain", "missing args");
     return;
@@ -2122,6 +2294,7 @@ void handle_api_bind() {
 }
 
 void handle_api_profile_save() {
+  if (!allow_write()) return;
   if (!server.hasArg("index") || !server.hasArg("note") || !server.hasArg("bind_phrase") ||
       !server.hasArg("uid_text")) {
     server.send(400, "text/plain", "missing args");
@@ -2143,6 +2316,7 @@ void handle_api_profile_save() {
 }
 
 void handle_api_profile_delete() {
+  if (!allow_write()) return;
   if (!server.hasArg("index")) {
     server.send(400, "text/plain", "missing index");
     return;
@@ -2159,6 +2333,7 @@ void handle_api_profile_delete() {
 }
 
 void handle_api_profile_apply() {
+  if (!allow_write()) return;
   if (!server.hasArg("index")) {
     server.send(400, "text/plain", "missing index");
     return;
@@ -2186,6 +2361,7 @@ void handle_api_profile_apply() {
 }
 
 void handle_api_log_cfg() {
+  if (!allow_write()) return;
   if (!server.hasArg("enabled") || !server.hasArg("keep_files") || !server.hasArg("log_gps") ||
       !server.hasArg("log_link") || !server.hasArg("log_battery") || !server.hasArg("log_attitude") ||
       !server.hasArg("log_unknown")) {
@@ -2208,6 +2384,7 @@ void handle_api_log_cfg() {
 }
 
 void handle_api_buzzer_cfg() {
+  if (!allow_write()) return;
   if (!server.hasArg("enabled") || !server.hasArg("u_en") || !server.hasArg("u_min") ||
       !server.hasArg("u_snd") || !server.hasArg("d_en") || !server.hasArg("d_min") ||
       !server.hasArg("d_snd") || !server.hasArg("lq_en") || !server.hasArg("lq_min") ||
@@ -2248,7 +2425,6 @@ void handle_api_buzzer_cfg() {
 }
 
 void handle_api_logs() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", logs_json());
 }
 
@@ -2279,16 +2455,25 @@ void handle_log_file() {
 }
 
 void handle_api_sounds() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", sounds_json());
 }
 
+bool upload_ok = false;
+bool upload_permitted = false;
+bool upload_exists = false;
+String upload_path;
+File upload_file;
+
 void handle_api_upload_sound() {
-  static File upload_file;
   HTTPUpload &up = server.upload();
   if (!sd_available) return;
 
   if (up.status == UPLOAD_FILE_START) {
+    upload_ok = false;
+    upload_exists = false;
+    upload_path = "";
+    upload_permitted = server.header("X-Backpack-Request") == "1";
+    if (!upload_permitted) return;
     String fn = up.filename;
     fn.replace("\\", "");
     fn.replace("/", "");
@@ -2297,11 +2482,16 @@ void handle_api_upload_sound() {
       return;
     }
     String path = "/sound/" + fn;
+    if (SD.exists(path.c_str())) { upload_exists = true; return; }
+    upload_path = path;
     upload_file = SD.open(path.c_str(), FILE_WRITE);
+    upload_ok = static_cast<bool>(upload_file);
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (upload_file) upload_file.write(up.buf, up.currentSize);
+    if (upload_file && upload_file.write(up.buf, up.currentSize) != up.currentSize) upload_ok = false;
   } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
     if (upload_file) upload_file.close();
+    if (up.status == UPLOAD_FILE_ABORTED) upload_ok = false;
+    if (!upload_ok && !upload_path.isEmpty()) SD.remove(upload_path.c_str());
   }
 }
 
@@ -2310,11 +2500,13 @@ void handle_api_upload_sound_done() {
     server.send(503, "text/plain", "sd not available");
     return;
   }
+  if (!upload_permitted) { server.send(403, "text/plain", "request denied"); return; }
+  if (upload_exists) { server.send(409, "text/plain", "sound already exists"); return; }
+  if (!upload_ok) { server.send(400, "text/plain", "upload failed"); return; }
   server.send(200, "text/plain", "upload done");
 }
 
 void handle_api_gps_points() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json; charset=utf-8", gps_points_json());
 }
 
@@ -2365,7 +2557,7 @@ bool init_espnow_for_elrs() {
     Serial.println("failed to apply ELRS UID as STA MAC");
     return false;
   }
-  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, WIFI_CHANNEL)) {
+  if (ap_password.isEmpty() || !WiFi.softAP(AP_SSID, ap_password.c_str(), WIFI_CHANNEL)) {
     Serial.println("softAP start failed");
     return false;
   }
@@ -2395,9 +2587,13 @@ bool init_espnow_for_elrs() {
 }
 
 void setup_web_routes() {
+  const char *headers[] = {"X-Backpack-Request"};
+  server.collectHeaders(headers, 1);
+  server.on("/qrcode.js", HTTP_GET, [](){ server.send_P(200, "application/javascript", QR_JS); });
   server.on("/", HTTP_GET, handle_root);
   server.on("/api/telemetry", HTTP_GET, handle_api_telemetry);
   server.on("/api/config", HTTP_GET, handle_api_config);
+  server.on("/api/wifi_password", HTTP_POST, handle_api_wifi_password);
   server.on("/api/time_sync", HTTP_POST, handle_api_time_sync);
   server.on("/api/bind", HTTP_POST, handle_api_bind);
   server.on("/api/profile_save", HTTP_POST, handle_api_profile_save);
@@ -2436,6 +2632,15 @@ void setup() {
   pinMode(BOARD_BATTERY_ADC_PIN, INPUT);
 
   load_config();
+  ap_password = DEFAULT_AP_PASSWORD;
+  if (prefs.begin("backpack-ap", false)) {
+    const String saved_password = prefs.getString("password", "");
+    if (saved_password.length() >= 8 && saved_password.length() <= 63) ap_password = saved_password;
+    prefs.end();
+  } else {
+    ap_password = "";
+    Serial.println("AP password storage failed; Wi-Fi disabled");
+  }
   ensure_sd_card();
 
   Serial.println();

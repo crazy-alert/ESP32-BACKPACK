@@ -57,6 +57,33 @@ C:\Users\sid\.platformio\penv\Scripts\platformio.exe device monitor --port COM8 
 
 ## ELRS Setup
 
+The initial Wi-Fi password for `ELRS-Backpack` is `12345678`. To change it,
+open the web panel, select **Settings**, enter and confirm a new password of
+8–63 printable ASCII characters, and save it. Restart the ESP32 to apply it;
+the previous password remains active until then. A previously saved password
+is preserved when updating the firmware. The panel warns while the default
+password is active.
+
+Flight-mode based logging recognises Betaflight mode strings and their disarmed
+suffixes. Unknown or stale mode data is displayed as unknown and stops logging;
+verify the mode format and logging on the bench for your flight controller.
+GPS, battery, link and attitude values are marked stale independently after
+10 seconds without a matching telemetry frame. The GPS QR generator is local
+and does not require internet access.
+
+The Connection card distinguishes recently received Backpack frames from model
+telemetry; the former does not prove that a receiver is bound or connected.
+Measurements that have never arrived show `No data`, while old measurements
+show their age. Link-quality and RSSI alarms require a recent link-statistics
+frame, so zero-initialised values do not trigger an alarm at startup. The
+logging status identifies missing SD, unknown ARM, waiting for ARM and active
+recording. Active alarms are listed separately on the telemetry page.
+
+To run the UI regression check, install Playwright with Chromium separately,
+then run `node test/ui.test.cjs` with `playwright` available on Node's module
+path. Set `CHROME_PATH` to use a locally installed Chrome if needed. The test
+uses mock API responses and does not replace an on-device test.
+
 In ELRS Lua on transmitter:
 - `Backpack -> Telemetry -> ESPNOW`
 
